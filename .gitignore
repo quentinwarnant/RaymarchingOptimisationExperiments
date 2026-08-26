@@ -1,0 +1,66 @@
+# Build outputs
+build/
+build-vdb/
+out/
+x64/
+Debug/
+Release/
+
+# vcpkg
+vcpkg_installed/
+vcpkg/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.aps
+*.ncb
+enc_temp_folder/
+
+# DXC / shader outputs
+*.cso
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+
+# Cache-test artifacts (keep goldens, exclude generated outputs)
+cache-test-results/*.png
+cache-test-results/*.ppm
+cache-test-results/report.json
+!cache-test-results/reference/
+# Reference goldens are intentionally NOT ignored so A/B tests are reproducible.
+
+# ImGui persisted layout
+imgui.ini
+
+# Large asset caches
+Assets/**/*.vdb
+Assets/**/*.pcache
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Session state (this Copilot session's scratch)
+.copilot/
