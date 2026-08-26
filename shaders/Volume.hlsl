@@ -70,6 +70,15 @@ Texture3D<float> RemappedVolume : register(t6);
 StructuredBuffer<uint> TileClassificationRead : register(t7);
 Texture3D<float4> NormalLUT : register(t8);
 Texture3D<float> DistanceField : register(t9);
+// Distance-field encoding. The bake writes normalised distances-to-nearest-dense in
+// [0, horizon] where horizon = 16/128 = 0.125 (see BakeDistanceFieldInitCS). Since the
+// stored dynamic range only uses ~12% of a 0..1 texture, we scale by DF_ENCODE_SCALE to
+// use the full R8_UNORM range and get better precision-per-bit. Bake writes value*SCALE,
+// render/debug reads back sample/SCALE. horizon*SCALE = 1.0 saturates exactly at the
+// texture max.
+static const float DF_ENCODE_SCALE = 8.0;
+static const float DF_DECODE_SCALE = 1.0 / DF_ENCODE_SCALE;
+
 SamplerState LinearClamp : register(s0);
 static const uint InvalidCell = 0xffffffffu;
 
@@ -314,16 +323,29 @@ float SampleCachedDepth(float3 uvw)
     return CachedDepthRead.SampleLevel(LinearClamp, uvw, 0);
 }
 
-// Wrapped point-load of the coarse distance field. Under ENABLE_DENSITY_COUNTING we
-// bump the per-thread DF counter for the heatmap; non-count PSOs compile to a straight
-// Load with no register overhead. DDA/DF is called on every march step when the
+// Wrapped read of the coarse distance field. Under ENABLE_DENSITY_COUNTING we bump
+// the per-thread DF counter for the heatmap; non-count PSOs compile to a straight
+// tap with no register overhead. DDA/DF is called on every march step when the
 // Empty-space DDA skipping optimisation is enabled.
+//
+// Option 1 change: use SampleLevel with the LinearClamp sampler sampled at cell
+// centres ((cell + 0.5) / dfDim) instead of Load(int4(cell, 0)). Point-position at
+// texel centre is equivalent to a nearest-neighbour lookup (no interpolation), but
+// unlike Load() it goes through the L1TEX cache — adjacent threads hitting the same
+// DF cell now hit the cache instead of firing independent LGSB fetches. On a 3D grid
+// with 8×8 wave locality this is a meaningful bandwidth cut.
+// Option 5 decode: the field is stored scaled (see DF_ENCODE_SCALE) so multiply back
+// down. Fused into the return so the compiler treats it as a free constant multiply.
 float SampleDistanceFieldCell(int3 cell)
 {
 #ifdef ENABLE_DENSITY_COUNTING
     ++g_dfSampleCount;
 #endif
-    return DistanceField.Load(int4(cell, 0));
+    // dfDim baked here explicitly to avoid capturing outer-scope state. Kept as a
+    // compile-time constant so the divide folds.
+    const float dfDimC = 128.0;
+    float3 uvw = (float3(cell) + 0.5) * (1.0 / dfDimC);
+    return DistanceField.SampleLevel(LinearClamp, uvw, 0) * DF_DECODE_SCALE;
 }
 
 float CachedOpticalDepth(float3 p)
@@ -583,6 +605,15 @@ float4 TraceVolume(uint2 pixel, bool useCache)
     const float dfDim = 128.0;
     const float invDfDim = 1.0 / 128.0;
     float t = nearT + rayOffset * stepLength;
+#ifdef ENABLE_DISTANCE_FIELD
+    // Last-cell DF cache. Across march steps that stay within one DF cell (common on
+    // the first iterations of a fine march inside a partially-empty cell, and on
+    // occupancy-skip returns), the DF value is invariant. Cache it and skip the
+    // Load(). Sentinel int3(-1) forces the first iteration to fetch. Only compiled
+    // when DDA is enabled so the non-DF PSOs pay zero register cost.
+    int3  lastDfCell = int3(-1, -1, -1);
+    float lastDfValue = 0.0;
+#endif
     // Density prefetch state: at the end of each iteration we issue the density fetch for
     // the NEXT iteration's sample position so the texture return latency (dominant LGSB
     // stall in the profile) overlaps with the current iteration's lighting math. Skip
@@ -613,7 +644,20 @@ float4 TraceVolume(uint2 pixel, bool useCache)
             // so their post-skip t values match to within a smooth continuous variation
             // (no accumulated per-pixel step-count divergence).
             uint3 cell = uint3(clamp(uvw * dfDim, 0.0, dfDim - 1.0));
-            float dfHere = SampleDistanceFieldCell(int3(cell));
+            // Last-cell cache: if we're still in the same DF cell as the previous
+            // step, reuse the cached value and skip the Load. Big win in tight/dense
+            // regions where fine density-steps stay in one DF cell for many iterations.
+            float dfHere;
+            if (all(int3(cell) == lastDfCell))
+            {
+                dfHere = lastDfValue;
+            }
+            else
+            {
+                dfHere = SampleDistanceFieldCell(int3(cell));
+                lastDfCell  = int3(cell);
+                lastDfValue = dfHere;
+            }
             if (dfHere > 0.5 * invDfDim)
             {
                 // Determine how many DF cells we can safely walk before needing to sample
@@ -1467,7 +1511,9 @@ void BakeDistanceFieldInitCS(uint3 id : SV_DispatchThreadID)
     // 0.001) under-marks cells and lets skipping wave past voxels naive would integrate.
     float rawThreshold = 0.001 / max(VolumeParameters.x, 1e-4);
     const float horizon = 16.0 / 128.0;
-    DistanceFieldWriteA[id] = density > rawThreshold ? 0.0 : horizon;
+    // Encode with DF_ENCODE_SCALE so we use the full 0..1 range of R8_UNORM. See the
+    // decode in SampleDistanceFieldCell. Zero maps to zero either way.
+    DistanceFieldWriteA[id] = (density > rawThreshold ? 0.0 : horizon) * DF_ENCODE_SCALE;
 }
 
 [numthreads(4,4,4)]
@@ -1477,7 +1523,9 @@ void BakeDistanceFieldPropagateCS(uint3 id : SV_DispatchThreadID)
     DistanceFieldWriteA.GetDimensions(dims.x, dims.y, dims.z);
     if (any(id >= dims)) return;
     uint direction = DispatchParameters.w & 1u;
-    float cellStep = 1.0 / float(dims.x);
+    // cellStep is pre-scaled since the field is stored scaled (see DF_ENCODE_SCALE).
+    // best/neighbor already come out pre-scaled from previous passes/init.
+    float cellStep = DF_ENCODE_SCALE / float(dims.x);
     float best = direction == 0 ? DistanceFieldWriteA[id] : DistanceFieldWriteB[id];
     [unroll] for (int dz = -1; dz <= 1; ++dz)
     [unroll] for (int dy = -1; dy <= 1; ++dy)

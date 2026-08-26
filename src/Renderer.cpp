@@ -681,13 +681,16 @@ bool Renderer::CreateVdbResources()
         return false;
     }
 
-    // Empty-space distance field: two 128^3 R16_FLOAT textures for ping-pong propagation.
-    // R16_FLOAT (vs R8_UNORM) gives ~65k quantisation levels over the [0, horizon] range,
-    // eliminating the ~1-stepLength jumps between adjacent texels that were producing
-    // faint wave-boundary artifacts in mid-tone cloud regions.
+    // Empty-space distance field: two 128^3 R8_UNORM textures for ping-pong propagation.
+    // The stored range only uses [0, 16/128 = 0.125] normalised distances, so we scale
+    // by DF_ENCODE_SCALE (=8.0) at bake time to use the full R8_UNORM range and get
+    // ~1/(255*DF_DECODE_SCALE) = ~0.5-cell precision, which is well above the DDA's
+    // floor()'d cell-count granularity. Halves texture bandwidth vs R16_FLOAT and
+    // doubles L1TEX cache density — meaningful on this texture-latency-bound shader.
     const uint32_t dfRes = 128;
-    if (!createUavTexture3D(dfRes, dfRes, dfRes, DXGI_FORMAT_R16_FLOAT, m_distanceFieldTextureA) ||
-        !createUavTexture3D(dfRes, dfRes, dfRes, DXGI_FORMAT_R16_FLOAT, m_distanceFieldTextureB))
+    const DXGI_FORMAT dfFormat = DXGI_FORMAT_R8_UNORM;
+    if (!createUavTexture3D(dfRes, dfRes, dfRes, dfFormat, m_distanceFieldTextureA) ||
+        !createUavTexture3D(dfRes, dfRes, dfRes, dfFormat, m_distanceFieldTextureB))
     {
         SetError("Failed to create distance-field textures.");
         return false;
@@ -697,7 +700,7 @@ bool Renderer::CreateVdbResources()
     {
         D3D12_UNORDERED_ACCESS_VIEW_DESC dfUav{};
         dfUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
-        dfUav.Format = DXGI_FORMAT_R16_FLOAT;
+        dfUav.Format = dfFormat;
         dfUav.Texture3D.MipSlice = 0;
         dfUav.Texture3D.WSize = dfRes;
         m_device->CreateUnorderedAccessView(m_distanceFieldTextureA.Get(), nullptr, &dfUav,
@@ -709,7 +712,7 @@ bool Renderer::CreateVdbResources()
         dfSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         dfSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
         dfSrv.Texture3D.MipLevels = 1;
-        dfSrv.Format = DXGI_FORMAT_R16_FLOAT;
+        dfSrv.Format = dfFormat;
         m_device->CreateShaderResourceView(m_distanceFieldTextureA.Get(), &dfSrv,
             CpuHandle(DistanceFieldSrv));
     }
