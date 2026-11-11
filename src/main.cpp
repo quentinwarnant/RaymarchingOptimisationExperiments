@@ -5,10 +5,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -181,6 +183,43 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         return 1;
     }
 
+    // Scan Assets/ next to the executable for VDB files. The dropdown offers each
+    // discovered file; selection swaps the active volume via Renderer::LoadVolume,
+    // which invalidates the transmittance cache and normal LUT so the next frame
+    // rebakes them against the new density field.
+    struct AssetEntry { std::string displayName; std::filesystem::path fullPath; };
+    std::vector<AssetEntry> assets;
+    int selectedAsset = 0;
+    int pendingAssetIndex = -1;
+    {
+        wchar_t executablePath[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, executablePath, MAX_PATH);
+        const std::filesystem::path assetDir =
+            std::filesystem::path(executablePath).parent_path() / L"Assets";
+        std::error_code errorCode;
+        if (std::filesystem::exists(assetDir, errorCode))
+        {
+            for (const auto& entry : std::filesystem::directory_iterator(assetDir, errorCode))
+            {
+                if (!entry.is_regular_file()) continue;
+                const auto ext = entry.path().extension().string();
+                if (ext != ".vdb" && ext != ".VDB") continue;
+                assets.push_back({ entry.path().stem().string(), entry.path() });
+            }
+            std::sort(assets.begin(), assets.end(),
+                [](const AssetEntry& a, const AssetEntry& b) { return a.displayName < b.displayName; });
+            const std::string defaultName = "Altocumlus";
+            for (size_t i = 0; i < assets.size(); ++i)
+            {
+                if (assets[i].displayName == defaultName)
+                {
+                    selectedAsset = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+    }
+
     if (!cacheTest)
     {
         ShowWindow(window, showCommand);
@@ -237,7 +276,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         smoothedCpuFrameMs = smoothedCpuFrameMs == 0.0f
             ? cpuFrameMs
             : smoothedCpuFrameMs + timingSmoothing * (cpuFrameMs - smoothedCpuFrameMs);
-        ShiftHistory(cpuHistory, smoothedCpuFrameMs);
+        // Store the raw per-frame CPU time so the graph shows true spikes; the
+        // EMA-smoothed value is passed alongside as the "avg" annotation.
+        ShiftHistory(cpuHistory, cpuFrameMs);
+
+        // Perform any queued asset swap BEFORE BeginFrame so the load happens between
+        // frames — the command list is closed here, so LoadVolume can freely reset
+        // command allocators and issue upload copies without stomping on an open list.
+        if (pendingAssetIndex >= 0 && pendingAssetIndex < static_cast<int>(assets.size()))
+        {
+            if (renderer.LoadVolume(assets[pendingAssetIndex].fullPath))
+            {
+                selectedAsset = pendingAssetIndex;
+                settings.rebuildCache = true;
+            }
+            pendingAssetIndex = -1;
+        }
 
         renderer.BeginFrame();
         ImGui_ImplDX12_NewFrame();
@@ -246,6 +300,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 
         if (cacheTest)
         {
+            // Cache-test measures raw naive vs cached agreement, so it must
+            // compare bit-exact per-frame cache output — not sub-Nyquist
+            // interpolated output which by design diverges from the naive
+            // exact-light-dir render. Force sub-N and amortize off, and hold
+            // the light static so cache and naive integrate the same volume.
+            settings.useLightCacheSubNyquist = false;
+            settings.useAmortizedCache = false;
+            settings.rotateLight = false;
+
             if (testFrames >= 10 && testTimingSamples < 24)
             {
                 testTimingSum += renderer.GetStats().gpuRenderSampleMs;
@@ -390,6 +453,31 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         ImGui::SetNextWindowSize(ImVec2(390, 650), ImGuiCond_FirstUseEver);
         ImGui::Begin("Raymarching Controls");
 
+        // Volume asset dropdown: lazy-swap the active VDB. Selection queues a pending
+        // index; the actual load is performed at the top of the next frame BEFORE
+        // BeginFrame() so we don't tear down VDB resources while the current frame's
+        // command list is open — that would close the list mid-frame and hang Render.
+        if (!assets.empty())
+        {
+            ImGui::TextUnformatted("Volume asset");
+            const char* preview = assets[selectedAsset].displayName.c_str();
+            if (ImGui::BeginCombo("##asset", preview))
+            {
+                for (int i = 0; i < static_cast<int>(assets.size()); ++i)
+                {
+                    const bool isSelected = (i == selectedAsset);
+                    if (ImGui::Selectable(assets[i].displayName.c_str(), isSelected)
+                        && i != selectedAsset)
+                    {
+                        pendingAssetIndex = i;
+                    }
+                    if (isSelected)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+        }
+
         int mode = static_cast<int>(settings.mode);
         ImGui::TextUnformatted("Lighting method");
         ImGui::RadioButton("Naive nested shadow march", &mode, 0);
@@ -410,10 +498,109 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                 smoothedCpuFrameMs > 0.0f ? 1000.0f / smoothedCpuFrameMs : 0.0f);
             ImGui::Text("GPU scene: %.3f ms", stats.gpuRenderMs);
             ImGui::Text("GPU total: %.3f ms", stats.gpuTotalMs);
-            ImGui::PlotLines("GPU scene ms", stats.gpuHistory.data(),
-                static_cast<int>(stats.gpuHistory.size()), 0, nullptr, 0.0f, 25.0f, ImVec2(0, 55));
-            ImGui::PlotLines("CPU frame ms", cpuHistory.data(),
-                static_cast<int>(cpuHistory.size()), 0, nullptr, 0.0f, 33.0f, ImVec2(0, 55));
+            // Auto-scaled ms plot: Y-axis fits max-of-history * 1.08 so the top peak
+            // never touches the frame; horizontal min/max lines annotate the extrema.
+            auto PlotMsAutoScale = [](const char* label, const float* data, int count,
+                                      float emaAvg)
+            {
+                if (count <= 0) { ImGui::Text("%s: n/a", label); return; }
+                // True min/max/mean of the raw per-frame samples in the ring buffer.
+                // These are unsmoothed, so a single cache-rebuild spike shows up in
+                // max — that's what the user wants to see. Skip zero-valued warm-up
+                // samples so they don't drag the "min" line to zero for the first
+                // ~180 frames after startup.
+                float lo = std::numeric_limits<float>::infinity();
+                float hi = -std::numeric_limits<float>::infinity();
+                double sum = 0.0;
+                int populated = 0;
+                for (int i = 0; i < count; ++i)
+                {
+                    const float v = data[i];
+                    if (v <= 0.0f) continue;
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                    sum += v;
+                    ++populated;
+                }
+                if (populated == 0) { lo = 0.0f; hi = 1.0f; }
+                if (!std::isfinite(lo) || !std::isfinite(hi)) { lo = 0.0f; hi = 1.0f; }
+                const float rawAvg = populated > 0
+                    ? static_cast<float>(sum / populated) : 0.0f;
+                // Dynamic Y-axis: baseline slightly below min so the value band fills
+                // most of the plot rect (better readability than always starting at 0),
+                // and top padded above the max so peaks stay in-frame. Keeps zero
+                // visible when min is very small so the visual "size" of a spike still
+                // reads correctly.
+                if (hi - lo < 1e-4f) hi = lo + std::max(lo * 0.1f, 0.01f);
+                const float pad = 0.10f * (hi - lo);
+                const float topScale = hi + pad;
+                float bottomScale = std::max(0.0f, lo - pad);
+                if (lo < pad * 2.0f) bottomScale = 0.0f;
+                ImGui::PlotLines(label, data, count, 0, nullptr, bottomScale, topScale,
+                    ImVec2(0, 55));
+                const ImVec2 rectMin = ImGui::GetItemRectMin();
+                const ImVec2 rectMax = ImGui::GetItemRectMax();
+                const float width = rectMax.x - rectMin.x;
+                const float height = rectMax.y - rectMin.y;
+                if (width < 4.0f || height < 4.0f) return;
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const float range = std::max(topScale - bottomScale, 1e-6f);
+                auto yFor = [&](float v)
+                {
+                    const float t = std::clamp((v - bottomScale) / range, 0.0f, 1.0f);
+                    return rectMax.y - t * height;
+                };
+                const float yMax = yFor(hi);
+                const float yMin = yFor(lo);
+                const float yAvg = yFor(emaAvg > 0.0f ? emaAvg : rawAvg);
+                const ImU32 colMax = IM_COL32(255, 120, 100, 220);
+                const ImU32 colMin = IM_COL32(120, 220, 140, 220);
+                const ImU32 colAvg = IM_COL32(150, 180, 255, 220);
+                dl->AddLine(ImVec2(rectMin.x, yMax), ImVec2(rectMax.x, yMax), colMax, 1.0f);
+                dl->AddLine(ImVec2(rectMin.x, yMin), ImVec2(rectMax.x, yMin), colMin, 1.0f);
+                dl->AddLine(ImVec2(rectMin.x, yAvg), ImVec2(rectMax.x, yAvg), colAvg, 1.0f);
+                char buf[64];
+                const float lineH = ImGui::GetTextLineHeight();
+                // Min/max on the LEFT edge, avg (EMA) on the RIGHT edge so the two
+                // groups never overlap regardless of where the values fall.
+                const float xLeft = rectMin.x + 4.0f;
+                auto placeLeft = [&](float y, ImU32 col, const char* text)
+                {
+                    float labelY = y - lineH;
+                    if (labelY < rectMin.y + 1.0f) labelY = y + 1.0f;
+                    if (labelY + lineH > rectMax.y - 1.0f) labelY = rectMax.y - lineH - 1.0f;
+                    dl->AddText(ImVec2(xLeft, labelY), col, text);
+                };
+                auto placeRight = [&](float y, ImU32 col, const char* text)
+                {
+                    const ImVec2 sz = ImGui::CalcTextSize(text);
+                    float labelY = y - lineH;
+                    if (labelY < rectMin.y + 1.0f) labelY = y + 1.0f;
+                    if (labelY + lineH > rectMax.y - 1.0f) labelY = rectMax.y - lineH - 1.0f;
+                    dl->AddText(ImVec2(rectMax.x - sz.x - 4.0f, labelY), col, text);
+                };
+                if (yMin - yMax < lineH + 4.0f)
+                {
+                    std::snprintf(buf, sizeof(buf), "min %.3f  max %.3f", lo, hi);
+                    placeLeft((yMax + yMin) * 0.5f, colMax, buf);
+                }
+                else
+                {
+                    std::snprintf(buf, sizeof(buf), "max %.3f", hi);
+                    placeLeft(yMax, colMax, buf);
+                    std::snprintf(buf, sizeof(buf), "min %.3f", lo);
+                    placeLeft(yMin, colMin, buf);
+                }
+                std::snprintf(buf, sizeof(buf), "avg %.3f (EMA)",
+                    emaAvg > 0.0f ? emaAvg : rawAvg);
+                placeRight(yAvg, colAvg, buf);
+            };
+            PlotMsAutoScale("GPU scene ms", stats.gpuHistory.data(),
+                static_cast<int>(stats.gpuHistory.size()), stats.gpuRenderMs);
+            PlotMsAutoScale("GPU total ms", stats.gpuTotalHistory.data(),
+                static_cast<int>(stats.gpuTotalHistory.size()), stats.gpuTotalMs);
+            PlotMsAutoScale("CPU frame ms", cpuHistory.data(),
+                static_cast<int>(cpuHistory.size()), smoothedCpuFrameMs);
         }
 
         ImGui::SeparatorText("Volume and integration");
@@ -488,6 +675,31 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                 cacheChanged = true;
             }
             cacheChanged |= ImGui::SliderFloat3("Direction to light", &settings.lightDirection.x, -1.0f, 1.0f);
+            // Spherical light-orientation controls. Read the current xyz back into
+            // yaw/pitch each frame so they stay in sync when the xyz slider is used;
+            // any drag on yaw/pitch overwrites lightDirection with a re-normalised
+            // xyz derived from the spherical pose.
+            {
+                DirectX::XMFLOAT3& L = settings.lightDirection;
+                float len = std::sqrt(L.x*L.x + L.y*L.y + L.z*L.z);
+                float lightPitch = 0.0f, lightYaw = 0.0f;
+                if (len > 1e-4f)
+                {
+                    lightPitch = std::asin(std::clamp(L.y / len, -1.0f, 1.0f));
+                    lightYaw   = std::atan2(L.x, L.z);
+                }
+                bool dragged = false;
+                dragged |= ImGui::SliderAngle("Light yaw",   &lightYaw,   -180.0f, 180.0f);
+                dragged |= ImGui::SliderAngle("Light pitch", &lightPitch,  -89.0f,  89.0f);
+                if (dragged)
+                {
+                    float cp = std::cos(lightPitch);
+                    L.x = std::sin(lightYaw) * cp;
+                    L.y = std::sin(lightPitch);
+                    L.z = std::cos(lightYaw) * cp;
+                    cacheChanged = true;
+                }
+            }
             cacheChanged |= ImGui::Checkbox("Rotate light around up axis", &settings.rotateLight);
             ImGui::BeginDisabled(!settings.rotateLight);
             ImGui::SliderFloat("Light rotation speed", &settings.lightRotationSpeed, -2.0f, 2.0f, "%.3f rad/s");
@@ -559,6 +771,50 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
                                   "                 Zero unless 'Empty-space DDA skipping'\n"
                                   "                 is enabled.");
             ImGui::DragInt("Heatmap max samples", &settings.heatmapMaxSamples, 4.0f, 8, 4096);
+            ImGui::EndDisabled();
+            ImGui::Checkbox("Temporal frame reuse", &settings.useTemporalReuse);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Reuse the previous frame's Output verbatim on frames where\n"
+                                  "camera pose AND every setting are bit-exactly unchanged.\n"
+                                  "Big win for idle-camera iteration; any input (mouse drag,\n"
+                                  "slider tweak, orbit) fully invalidates and re-marches the\n"
+                                  "frame. Ghost-free by construction — never reuses partial\n"
+                                  "or reprojected content.");
+            ImGui::BeginDisabled(!settings.useTemporalReuse);
+            ImGui::Checkbox("Debug: reuse validity heatmap", &settings.debugTemporalReuse);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Green = pixel filled from prev-frame reprojection.\n"
+                                  "Red   = pixel had to be raymarched.");
+            ImGui::EndDisabled();
+            ImGui::Checkbox("Motion-adaptive step count", &settings.motionAdaptiveSteps);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("While the camera or light is moving, march with 70%% of\n"
+                                  "the configured primarySteps/shadowSteps and stepScale bumped\n"
+                                  "1/0.7 to preserve volume coverage. Coarser sampling is\n"
+                                  "perceptually masked by motion. Single-frame — no ghosting,\n"
+                                  "no history required.");
+            ImGui::Checkbox("Sub-Nyquist light cache", &settings.useLightCacheSubNyquist);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Only rebuild the coarse light cache when the light dir has\n"
+                                  "moved by > threshold degrees since the last build. Between\n"
+                                  "rebuilds, the shader lerps between the previous and current\n"
+                                  "cache pose to hide the update seam. Rebuild stays on the\n"
+                                  "graphics queue — perf win = fewer rebuilds/sec (cycling\n"
+                                  "light, autorotate), not hidden cost.\n"
+                                  "Cached mode only. Bit-exact when off.");
+            ImGui::BeginDisabled(!settings.useLightCacheSubNyquist);
+            ImGui::Checkbox("Amortize cache rebuilds", &settings.useAmortizedCache);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Progressively builds a hidden third light-cache buffer over\n"
+                                  "the frames before the next sub-Nyquist handoff, then swaps\n"
+                                  "it into the outgoing A/B display slot when complete.\n"
+                                  "Falls back to the synchronous rebuild if rotation is too fast.");
+            ImGui::SliderFloat("Cache rebuild threshold (deg)",
+                &settings.lightCacheAngleThresholdDeg, 1.0f, 30.0f, "%.1f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Light-direction angle (deg) between cache rebuilds. Small\n"
+                                  "= near-continuous rebuilds (approaches no perf win); large\n"
+                                  "= visible shadow-direction drift smoothed only by interp.");
             ImGui::EndDisabled();
             ImGui::Checkbox("Interval-finding + shading split (A/B)", &settings.useSplitTrace);
             if (ImGui::IsItemHovered())

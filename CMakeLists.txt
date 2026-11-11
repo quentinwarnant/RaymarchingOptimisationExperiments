@@ -63,64 +63,89 @@ endif()
 add_custom_command(TARGET DX12Raymarching POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:DX12Raymarching>/shaders"
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:DX12Raymarching>/Assets"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/Assets/Altocumlus.vdb"
-        "$<TARGET_FILE_DIR:DX12Raymarching>/Assets/Altocumlus.vdb"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/Assets"
+        "$<TARGET_FILE_DIR:DX12Raymarching>/Assets"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${WINPIX_DLL}"
         "$<TARGET_FILE_DIR:DX12Raymarching>/WinPixEventRuntime.dll"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E ResolveColumnsCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/ResolveColumnsCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E NaiveRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DISTANCE_FIELD=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DISTANCE_FIELD=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/NaiveRenderCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D USE_NORMAL_LUT=1
+        -Zi -Zss -Qembed_debug -D USE_NORMAL_LUT=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderLutCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DISTANCE_FIELD=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DISTANCE_FIELD=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DISTANCE_FIELD=1 -D USE_NORMAL_LUT=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DISTANCE_FIELD=1 -D USE_NORMAL_LUT=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFLutCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
+    # NoSubN variants of the four primary cached PSOs (surface normals on, no debug/
+    # heatmap/reduced-tap). Compiled without USE_SUB_NYQUIST so DXC dead-strips every
+    # SampleCachedDepthB, NormalLUTB, and gradB world-space blend — dropping peak
+    # register pressure and unlocking a higher SM warp occupancy tier. Selected at
+    # dispatch time when RenderSettings::useLightCacheSubNyquist is false.
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D DISABLE_SURFACE_NORMALS=1
+        -Zi -Zss -Qembed_debug
+        -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderNoSubNCS.cso"
+        -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
+    COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
+        -Zi -Zss -Qembed_debug -D USE_NORMAL_LUT=1
+        -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderLutNoSubNCS.cso"
+        -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
+    COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
+        -Zi -Zss -Qembed_debug -D ENABLE_DISTANCE_FIELD=1
+        -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFNoSubNCS.cso"
+        -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
+    COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
+        -Zi -Zss -Qembed_debug -D ENABLE_DISTANCE_FIELD=1 -D USE_NORMAL_LUT=1
+        -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFLutNoSubNCS.cso"
+        -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
+    COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
+        -Zi -Zss -Qembed_debug -D DISABLE_SURFACE_NORMALS=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderNoSNCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D USE_NORMAL_LUT=1 -D DISABLE_SURFACE_NORMALS=1
+        -Zi -Zss -Qembed_debug -D USE_NORMAL_LUT=1 -D DISABLE_SURFACE_NORMALS=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderLutNoSNCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DISTANCE_FIELD=1 -D DISABLE_SURFACE_NORMALS=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DISTANCE_FIELD=1 -D DISABLE_SURFACE_NORMALS=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFNoSNCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DISTANCE_FIELD=1 -D USE_NORMAL_LUT=1 -D DISABLE_SURFACE_NORMALS=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DISTANCE_FIELD=1 -D USE_NORMAL_LUT=1 -D DISABLE_SURFACE_NORMALS=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFLutNoSNCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_VOXEL_DEBUG=1
+        -Zi -Zss -Qembed_debug -D ENABLE_VOXEL_DEBUG=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDebugCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
@@ -128,12 +153,12 @@ add_custom_command(TARGET DX12Raymarching POST_BUILD
     # meaningful when the normal LUT is off (LUT path is already 1 tap). One PSO per DDA
     # mode. SN off doesn't need one (no gradient at all).
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D USE_REDUCED_TAP_NORMAL=1
+        -Zi -Zss -Qembed_debug -D USE_REDUCED_TAP_NORMAL=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderReducedTapCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D USE_REDUCED_TAP_NORMAL=1 -D ENABLE_DISTANCE_FIELD=1
+        -Zi -Zss -Qembed_debug -D USE_REDUCED_TAP_NORMAL=1 -D ENABLE_DISTANCE_FIELD=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFReducedTapCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
@@ -143,127 +168,142 @@ add_custom_command(TARGET DX12Raymarching POST_BUILD
     # (LUT × DF × NoSN × ReducedTap) so toggles show accurate cost deltas in the
     # overlay without polluting the shipping PSOs.
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DENSITY_COUNTING=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderCountCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D USE_NORMAL_LUT=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D USE_NORMAL_LUT=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderLutCountCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D ENABLE_DISTANCE_FIELD=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D ENABLE_DISTANCE_FIELD=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFCountCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D ENABLE_DISTANCE_FIELD=1 -D USE_NORMAL_LUT=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D ENABLE_DISTANCE_FIELD=1 -D USE_NORMAL_LUT=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFLutCountCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D DISABLE_SURFACE_NORMALS=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D DISABLE_SURFACE_NORMALS=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderNoSNCountCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D USE_NORMAL_LUT=1 -D DISABLE_SURFACE_NORMALS=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D USE_NORMAL_LUT=1 -D DISABLE_SURFACE_NORMALS=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderLutNoSNCountCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D ENABLE_DISTANCE_FIELD=1 -D DISABLE_SURFACE_NORMALS=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D ENABLE_DISTANCE_FIELD=1 -D DISABLE_SURFACE_NORMALS=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFNoSNCountCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D ENABLE_DISTANCE_FIELD=1 -D USE_NORMAL_LUT=1 -D DISABLE_SURFACE_NORMALS=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D ENABLE_DISTANCE_FIELD=1 -D USE_NORMAL_LUT=1 -D DISABLE_SURFACE_NORMALS=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFLutNoSNCountCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D USE_REDUCED_TAP_NORMAL=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D USE_REDUCED_TAP_NORMAL=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderReducedTapCountCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E CachedRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D USE_REDUCED_TAP_NORMAL=1 -D ENABLE_DISTANCE_FIELD=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DENSITY_COUNTING=1 -D USE_REDUCED_TAP_NORMAL=1 -D ENABLE_DISTANCE_FIELD=1 -D USE_SUB_NYQUIST=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/CachedRenderDFReducedTapCountCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E NaiveRenderCS
-        -Zi -Zsb -Qembed_debug -D ENABLE_DENSITY_COUNTING=1
+        -Zi -Zss -Qembed_debug -D ENABLE_DENSITY_COUNTING=1
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/NaiveRenderCountCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E HeatmapDisplayCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/HeatmapDisplayCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
+    COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E TemporalReprojectCS
+        -Zi -Zss -Qembed_debug
+        -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/TemporalReprojectCS.cso"
+        -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
+    COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E TemporalReuseDebugCS
+        -Zi -Zss -Qembed_debug
+        -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/TemporalReuseDebugCS.cso"
+        -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E BakeRemappedVolumeCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/BakeRemappedVolumeCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E BakeOccupancyCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/BakeOccupancyCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E ClassifyTilesCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/ClassifyTilesCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E DebugTileOverlayCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/DebugTileOverlayCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E BakeNormalLUTCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/BakeNormalLUTCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
+    COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E BakeNormalLUTBCS
+        -Zi -Zss -Qembed_debug
+        -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/BakeNormalLUTBCS.cso"
+        -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E BakeDistanceFieldInitCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/BakeDistanceFieldInitCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E BakeDistanceFieldPropagateCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/BakeDistanceFieldPropagateCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E DebugDistanceFieldCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/DebugDistanceFieldCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E FindHitIntervalCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/FindHitIntervalCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E SplitCachedRenderCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/SplitCachedRenderCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E ClearTileDispatchCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/ClearTileDispatchCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E SplitCachedRenderIndirectCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/SplitCachedRenderIndirectCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl"
     COMMAND "${DXC_EXECUTABLE}" -nologo -O3 -T cs_6_0 -E SplitCachedSkyCS
-        -Zi -Zsb -Qembed_debug
+        -Zi -Zss -Qembed_debug
         -Fo "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/SplitCachedSkyCS.cso"
         -Fd "$<TARGET_FILE_DIR:DX12Raymarching>/shaders/"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/Volume.hlsl")

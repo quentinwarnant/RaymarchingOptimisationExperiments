@@ -24,6 +24,31 @@ cbuffer Constants : register(b0)
     float4 LightCacheRightAxis;
     float4 LightCacheUpAxis;
     float4 LightCacheForwardAxis;
+    // Sub-Nyquist light cache: second *Scaled set for physical buffer B's
+    // light-frame axes. When A and B were baked at different directions,
+    // sampling both at the same uvw slides shadows over the geometry —
+    // SampleCachedDepthWorld computes uvw_B independently. When the feature
+    // is off (or A==B direction), these mirror the primary *Scaled entries
+    // and the sample is bit-exact identical.
+    float4 LightCacheRightScaledB;
+    float4 LightCacheUpScaledB;
+    float4 LightCacheForwardScaledB;
+    // Plain (unscaled) B-frame axes. Used by normal-tap gradient reconstruction
+    // to compose world-space gradients from B's uvw-space finite differences
+    // BEFORE blending, so a jump in A's axes at rebuild does not rotate the
+    // reconstructed normal discontinuously.
+    float4 LightCacheRightAxisB;
+    float4 LightCacheUpAxisB;
+    float4 LightCacheForwardAxisB;
+    // Cache-build column interval: x=start column, y=end column (exclusive).
+    // Scene shaders ignore this; ResolveColumnsCS uses it to amortize hidden
+    // cache builds over multiple frames.
+    float4 CacheBuildRange;
+    // Previous-frame camera state for temporal frame reuse. Set to the current-frame
+    // values on the first frame / after a global invalidation so reprojection maps to
+    // identity and yields nothing. .w of each is unused for now.
+    float4 PrevCameraPositionTime;
+    float4 PrevCameraTargetMode;
 };
 
 cbuffer DispatchConstants : register(b1)
@@ -60,6 +85,17 @@ RWStructuredBuffer<uint> IndirectDispatchArgsWrite : register(u13);
 // the heatmap display shader can sample it with the same descriptor heap as the light-
 // cache textures.
 RWTexture2D<uint> SampleCountWrite : register(u14);
+// Temporal frame reuse: per-pixel validity marker. Written by TemporalReprojectCS
+// (1 = reused successfully, 0 = full march required). Read by the main render entry
+// points to early-out. Cleared to 0 by the CPU each frame the reuse is disabled or
+// globally invalidated, so the check is a no-op.
+RWTexture2D<uint> ReuseValidMask : register(u15);
+// Sub-Nyquist normal LUT: second normal snapshot (physical buffer B's frame). Baked
+// only when we write physical B's transmittance cache; between rebuilds this holds
+// the last-baked normals in B's frame axes so the runtime shader can sample LUT_A at
+// uvwA and LUT_B at uvwB and blend, avoiding the every-threshold "shadow flash" that
+// would otherwise be visible with a single-LUT snapshot.
+RWTexture3D<float4> NormalLUTWriteB : register(u16);
 StructuredBuffer<uint2> CacheMetaRead : register(t0);
 StructuredBuffer<uint> FineDepthRead : register(t1);
 Texture3D<float> CachedDepthRead : register(t2);
@@ -70,6 +106,17 @@ Texture3D<float> RemappedVolume : register(t6);
 StructuredBuffer<uint> TileClassificationRead : register(t7);
 Texture3D<float4> NormalLUT : register(t8);
 Texture3D<float> DistanceField : register(t9);
+// Previous-frame colour texture for temporal reuse. Populated by CopyResource from
+// the previous frame's Output. Sampled at the reprojected pixel by TemporalReprojectCS.
+Texture2D<float4> HistoryColorRead : register(t10);
+// Sub-Nyquist light-cache: second coarse depth cache (physical buffer B). When the
+// feature is off, the SRV descriptor at this slot points at the same underlying
+// resource as CachedDepthRead (t2), so SampleCachedDepth's lerp(A, B, blend) with
+// blend=0 (CacheParameters.w) is bit-exact identical to reading only A.
+Texture3D<float> CachedDepthReadB : register(t11);
+// LUT_B: baked-normals snapshot for physical buffer B. When sub-N cross-fade is
+// inactive this SRV aliases NormalLUT (t8) so w=0 lerp returns LUT_A unchanged.
+Texture3D<float4> NormalLUTB : register(t12);
 // Distance-field encoding. The bake writes normalised distances-to-nearest-dense in
 // [0, horizon] where horizon = 16/128 = 0.125 (see BakeDistanceFieldInitCS). Since the
 // stored dynamic range only uses ~12% of a 0..1 texture, we scale by DF_ENCODE_SCALE to
@@ -293,6 +340,17 @@ float3 LightCacheUVW(float3 p)
         dot(p, LightCacheForwardScaled.xyz) + LightCacheForwardScaled.w));
 }
 
+// Buffer-B uvw. Used by SampleCachedDepthWorld to read physical B at the
+// light-frame axes it was baked with when sub-Nyquist has A and B baked at
+// different directions. When the feature is off, *ScaledB mirrors *Scaled.
+float3 LightCacheUVW_B(float3 p)
+{
+    return saturate(float3(
+        dot(p, LightCacheRightScaledB.xyz)   + LightCacheRightScaledB.w,
+        dot(p, LightCacheUpScaledB.xyz)      + LightCacheUpScaledB.w,
+        dot(p, LightCacheForwardScaledB.xyz) + LightCacheForwardScaledB.w));
+}
+
 float3 LightCacheToWorld(float3 p, float3 right, float3 up, float3 forward)
 {
     return right * p.x + up * p.y + forward * p.z;
@@ -311,48 +369,86 @@ float Phase(float c)
     return (1.0-g*g) / (12.56637 * pow(max(1.0+g*g-2.0*g*c, 1e-3), 1.5));
 }
 
-// Wrapped sampler for the CachedDepthRead SRV. Under ENABLE_DENSITY_COUNTING we bump
-// the per-thread depth-tap counter so the heatmap can visualise finite-diff normal
-// costs (SampleNormalFromCache*, CacheNormalDotLight). Non-count PSOs compile this
-// down to a straight SampleLevel with no register overhead.
-float SampleCachedDepth(float3 uvw)
+// Wrapped sampler for the CachedDepthRead SRVs. Under ENABLE_DENSITY_COUNTING we
+// bump the per-thread depth-tap counter so the heatmap can visualise finite-diff
+// normal costs (SampleNormalFromCache*, CacheNormalDotLight). Non-count PSOs compile
+// this down to a straight SampleLevel with no register overhead.
+//
+// Sub-Nyquist light-cache dual-frame-axis sample.
+//
+// Reads physical A at uvwA (its own light-frame uvw) and physical B at uvwB (its own).
+// When A and B were baked at different light directions (rotating light between
+// rebuilds), sampling both at a shared uvw introduces a geometric offset in whichever
+// buffer isn't aligned with that uvw's frame — visible as (a) shadows sliding over
+// clouds and (b) at rebuild moments the ping-pong role flip abruptly reverses the sign
+// of that offset, producing a per-rebuild "flash" on the shading normal derived from
+// finite differences of blended samples. Both artifacts vanish if each buffer is
+// sampled at its own bake-frame uvw.
+//
+// When the sub-Nyquist feature is off (or A and B are baked at the same direction),
+// the CPU fills *ScaledB to mirror *Scaled and uvwA == uvwB, so this is bit-exact
+// identical to a single-uvw single-fetch path (the two fetches resolve to the same
+// value; lerp collapses to A).
+float SampleCachedDepth(float3 uvwA, float3 uvwB)
 {
 #ifdef ENABLE_DENSITY_COUNTING
     ++g_cachedDepthSampleCount;
 #endif
-    return CachedDepthRead.SampleLevel(LinearClamp, uvw, 0);
+    float a = CachedDepthRead.SampleLevel(LinearClamp, uvwA, 0);
+    float b = CachedDepthReadB.SampleLevel(LinearClamp, uvwB, 0);
+    return lerp(a, b, CacheParameters.w);
 }
 
-// Wrapped read of the coarse distance field. Under ENABLE_DENSITY_COUNTING we bump
-// the per-thread DF counter for the heatmap; non-count PSOs compile to a straight
-// tap with no register overhead. DDA/DF is called on every march step when the
+// Per-buffer single-tap samplers. Used by the normal-tap gradient reconstruction
+// which must build gradA_world (from A axes) and gradB_world (from B axes)
+// separately, then blend in world space. Blending scalar sample values first and
+// decomposing with only A axes rotates the reconstructed normal by (dirBakedInA -
+// dirBakedInB) at every ping-pong rebuild — the visible per-threshold "flash".
+float SampleCachedDepthA(float3 uvwA)
+{
+#ifdef ENABLE_DENSITY_COUNTING
+    ++g_cachedDepthSampleCount;
+#endif
+    return CachedDepthRead.SampleLevel(LinearClamp, uvwA, 0);
+}
+
+float SampleCachedDepthB(float3 uvwB)
+{
+#ifdef ENABLE_DENSITY_COUNTING
+    ++g_cachedDepthSampleCount;
+#endif
+    return CachedDepthReadB.SampleLevel(LinearClamp, uvwB, 0);
+}
+
+// World-space entry point used by the direct transmittance query (CachedOpticalDepth).
+// Computes both uvws internally.
+float SampleCachedDepthWorld(float3 p)
+{
+    return SampleCachedDepth(LightCacheUVW(p), LightCacheUVW_B(p));
+}
+
+// Wrapped point-load of the coarse distance field. Under ENABLE_DENSITY_COUNTING we
+// bump the per-thread DF counter for the heatmap; non-count PSOs compile to a straight
+// Load with no register overhead. DDA/DF is called on every march step when the
 // Empty-space DDA skipping optimisation is enabled.
-//
-// Option 1 change: use SampleLevel with the LinearClamp sampler sampled at cell
-// centres ((cell + 0.5) / dfDim) instead of Load(int4(cell, 0)). Point-position at
-// texel centre is equivalent to a nearest-neighbour lookup (no interpolation), but
-// unlike Load() it goes through the L1TEX cache — adjacent threads hitting the same
-// DF cell now hit the cache instead of firing independent LGSB fetches. On a 3D grid
-// with 8×8 wave locality this is a meaningful bandwidth cut.
 // Option 5 decode: the field is stored scaled (see DF_ENCODE_SCALE) so multiply back
 // down. Fused into the return so the compiler treats it as a free constant multiply.
+//
+// Prior experiments (reverted, do NOT retry without measurement):
+// - Load() -> SampleLevel(LinearClamp) to go via L1TEX cache: sampler descriptor
+//   setup fattens the call site; SampleDistanceFieldCell showed up as its own
+//   6.06% self-time row and peak-reg rose. Measured 0.256 ms -> 0.35 ms interactive.
 float SampleDistanceFieldCell(int3 cell)
 {
 #ifdef ENABLE_DENSITY_COUNTING
     ++g_dfSampleCount;
 #endif
-    // dfDim baked here explicitly to avoid capturing outer-scope state. Kept as a
-    // compile-time constant so the divide folds.
-    const float dfDimC = 128.0;
-    float3 uvw = (float3(cell) + 0.5) * (1.0 / dfDimC);
-    return DistanceField.SampleLevel(LinearClamp, uvw, 0) * DF_DECODE_SCALE;
+    return DistanceField.Load(int4(cell, 0)) * DF_DECODE_SCALE;
 }
 
 float CachedOpticalDepth(float3 p)
 {
-    float3 right, up, forward;
-    float3 uvw = LightCacheUVWAndFrame(p, right, up, forward);
-    return SampleCachedDepth(uvw);
+    return SampleCachedDepthWorld(p);
 }
 
 float CachedLight(float3 p, float startDensity)
@@ -382,119 +478,170 @@ float3 OctDecode(float2 e)
     return normalize(n);
 }
 
-float3 SampleNormalFromCacheWithDelta(float3 uvwCenter, float delta)
+// Reconstruct world-space gradient of the light-cache scalar field via 6-tap central
+// finite differences. Sub-Nyquist correctness: gradient is reconstructed independently
+// for each physical buffer (A and B may be baked at different light directions) and
+// then blended in WORLD space. Blending scalar samples first and then decomposing
+// with only A's axes rotates the reconstructed normal by (dirBakedInA - dirBakedInB)
+// at every ping-pong rebuild — the visible per-threshold "flash".
+float3 SampleNormalFromCacheWithDelta(float3 uvwCenter, float3 uvwCenterB, float delta)
 {
-    float dXp = SampleCachedDepth(saturate(uvwCenter + float3(delta, 0, 0)));
-    float dXm = SampleCachedDepth(saturate(uvwCenter - float3(delta, 0, 0)));
-    float dYp = SampleCachedDepth(saturate(uvwCenter + float3(0, delta, 0)));
-    float dYm = SampleCachedDepth(saturate(uvwCenter - float3(0, delta, 0)));
-    float dZp = SampleCachedDepth(saturate(uvwCenter + float3(0, 0, delta)));
-    float dZm = SampleCachedDepth(saturate(uvwCenter - float3(0, 0, delta)));
-    float3 gradient = float3(dXp - dXm, dYp - dYm, dZp - dZm);
-    float3 right, up, forward, cacheMinimum, cacheMaximum;
-    LightCacheFrame(right, up, forward, cacheMinimum, cacheMaximum);
-    float3 worldGradient = gradient.x * right + gradient.y * up + gradient.z * forward;
+    float3 rightA, upA, forwardA, cacheMinimum, cacheMaximum;
+    LightCacheFrame(rightA, upA, forwardA, cacheMinimum, cacheMaximum);
+
+    float3 gradA_world = 0.0;
+    {
+        float dXp = SampleCachedDepthA(saturate(uvwCenter + float3(delta, 0, 0)));
+        float dXm = SampleCachedDepthA(saturate(uvwCenter - float3(delta, 0, 0)));
+        float dYp = SampleCachedDepthA(saturate(uvwCenter + float3(0, delta, 0)));
+        float dYm = SampleCachedDepthA(saturate(uvwCenter - float3(0, delta, 0)));
+        float dZp = SampleCachedDepthA(saturate(uvwCenter + float3(0, 0, delta)));
+        float dZm = SampleCachedDepthA(saturate(uvwCenter - float3(0, 0, delta)));
+        gradA_world = (dXp - dXm) * rightA + (dYp - dYm) * upA + (dZp - dZm) * forwardA;
+    }
+#ifdef USE_SUB_NYQUIST
+    float3 gradB_world = 0.0;
+    {
+        float dXp = SampleCachedDepthB(saturate(uvwCenterB + float3(delta, 0, 0)));
+        float dXm = SampleCachedDepthB(saturate(uvwCenterB - float3(delta, 0, 0)));
+        float dYp = SampleCachedDepthB(saturate(uvwCenterB + float3(0, delta, 0)));
+        float dYm = SampleCachedDepthB(saturate(uvwCenterB - float3(0, delta, 0)));
+        float dZp = SampleCachedDepthB(saturate(uvwCenterB + float3(0, 0, delta)));
+        float dZm = SampleCachedDepthB(saturate(uvwCenterB - float3(0, 0, delta)));
+        gradB_world = (dXp - dXm) * LightCacheRightAxisB.xyz
+                    + (dYp - dYm) * LightCacheUpAxisB.xyz
+                    + (dZp - dZm) * LightCacheForwardAxisB.xyz;
+    }
+    float3 worldGradient = lerp(gradA_world, gradB_world, CacheParameters.w);
+#else
+    float3 worldGradient = gradA_world;
+#endif
     float gradientLength = length(worldGradient);
     return gradientLength > 1e-5 ? -worldGradient / gradientLength : float3(0, 1, 0);
 }
 
-// Variant used by the runtime shading path where the caller already holds the cache
-// frame. Avoids a second inlined LightCacheFrame (which was doubling the 15-scalar frame
-// live range) and accumulates the world-space gradient one axis at a time so only two
-// depth samples are alive at once instead of all six.
-float3 SampleNormalFromCacheWithFrame(float3 uvwCenter, float delta,
+// Variant used by the runtime shading path where the caller already holds the A cache
+// frame. Reconstructs gradA in world space using the caller-provided A frame, gradB
+// via the cbuffer B axes, then blends world-space vectors.
+float3 SampleNormalFromCacheWithFrame(float3 uvwCenter, float3 uvwCenterB, float delta,
     float3 right, float3 up, float3 forward)
 {
-    float3 worldGradient = 0.0;
+    float3 gradA_world = 0.0;
     {
-        float dXp = SampleCachedDepth(saturate(uvwCenter + float3(delta, 0, 0)));
-        float dXm = SampleCachedDepth(saturate(uvwCenter - float3(delta, 0, 0)));
-        worldGradient += (dXp - dXm) * right;
+        float dXp = SampleCachedDepthA(saturate(uvwCenter + float3(delta, 0, 0)));
+        float dXm = SampleCachedDepthA(saturate(uvwCenter - float3(delta, 0, 0)));
+        gradA_world += (dXp - dXm) * right;
     }
     {
-        float dYp = SampleCachedDepth(saturate(uvwCenter + float3(0, delta, 0)));
-        float dYm = SampleCachedDepth(saturate(uvwCenter - float3(0, delta, 0)));
-        worldGradient += (dYp - dYm) * up;
+        float dYp = SampleCachedDepthA(saturate(uvwCenter + float3(0, delta, 0)));
+        float dYm = SampleCachedDepthA(saturate(uvwCenter - float3(0, delta, 0)));
+        gradA_world += (dYp - dYm) * up;
     }
     {
-        float dZp = SampleCachedDepth(saturate(uvwCenter + float3(0, 0, delta)));
-        float dZm = SampleCachedDepth(saturate(uvwCenter - float3(0, 0, delta)));
-        worldGradient += (dZp - dZm) * forward;
+        float dZp = SampleCachedDepthA(saturate(uvwCenter + float3(0, 0, delta)));
+        float dZm = SampleCachedDepthA(saturate(uvwCenter - float3(0, 0, delta)));
+        gradA_world += (dZp - dZm) * forward;
     }
+#ifdef USE_SUB_NYQUIST
+    float3 gradB_world = 0.0;
+    {
+        float dXp = SampleCachedDepthB(saturate(uvwCenterB + float3(delta, 0, 0)));
+        float dXm = SampleCachedDepthB(saturate(uvwCenterB - float3(delta, 0, 0)));
+        gradB_world += (dXp - dXm) * LightCacheRightAxisB.xyz;
+    }
+    {
+        float dYp = SampleCachedDepthB(saturate(uvwCenterB + float3(0, delta, 0)));
+        float dYm = SampleCachedDepthB(saturate(uvwCenterB - float3(0, delta, 0)));
+        gradB_world += (dYp - dYm) * LightCacheUpAxisB.xyz;
+    }
+    {
+        float dZp = SampleCachedDepthB(saturate(uvwCenterB + float3(0, 0, delta)));
+        float dZm = SampleCachedDepthB(saturate(uvwCenterB - float3(0, 0, delta)));
+        gradB_world += (dZp - dZm) * LightCacheForwardAxisB.xyz;
+    }
+    float3 worldGradient = lerp(gradA_world, gradB_world, CacheParameters.w);
+#else
+    float3 worldGradient = gradA_world;
+#endif
     float gradientLength = length(worldGradient);
     return gradientLength > 1e-5 ? -worldGradient / gradientLength : float3(0, 1, 0);
 }
 
-// Fused sampler used by the runtime shading path. Returns `dot(surfaceNormal, L)` as a
-// single scalar instead of a float3 normal. Rationale: the only consumer of the normal
-// in the hot path is `dot(normal, L)`; keeping the full 3-vector alive across the six
-// depth taps costs 3 registers of `worldGradient` accumulator plus 9 registers of
-// right/up/forward. This variant projects each axis onto L via 3 pre-computed scalar
-// axis-dot-L values (Rl, Ul, Fl) so the sampler holds only two scalar accumulators
-// (numerator + denomSq) at the tap. Peak sampler-local live-reg drops from ~18 to ~11.
-// Math: worldGradient = gx*right + gy*up + gz*forward
-//       dot(worldGradient, L) = gx*Rl + gy*Ul + gz*Fl                     (numer)
-//       |worldGradient|^2     = gx^2 + gy^2 + gz^2  (frame is orthonormal)
-//       dot(-normalize(worldGradient), L) = -numer * rsqrt(denomSq)
-float CacheNormalDotLight(float3 uvwCenter, float delta,
-    float Rl, float Ul, float Fl, float fallbackDotL)
+// Fused sampler that returns `dot(surfaceNormal, L)` as a scalar for the shading hot
+// path. Sub-Nyquist correctness requires per-buffer world-gradient reconstruction
+// (see SampleNormalFromCacheWithDelta comment), so the earlier register-saving
+// "axis-dot-L in uvw space" trick is no longer valid — it implicitly assumed a single
+// world axis frame for the whole gradient. We now materialise world-space gradA and
+// gradB explicitly, blend, then dot with L. This costs a few extra registers but the
+// finite-differences here are already the register-heaviest part of TraceVolume; the
+// correctness win at every threshold-crossing rebuild is required.
+float CacheNormalDotLight(float3 uvwCenter, float3 uvwCenterB, float delta,
+    float3 rightA, float3 upA, float3 forwardA,
+    float3 L, float fallbackDotL)
 {
-    float numer = 0.0;
-    float denomSq = 0.0;
+    float3 gradA_world = 0.0;
+#ifdef USE_SUB_NYQUIST
+    float3 gradB_world = 0.0;
+#endif
 #ifdef USE_REDUCED_TAP_NORMAL
-    // Reduced-tap variant: 4-tap forward differences instead of 6-tap central. Saves 2
-    // texture fetches per gradient. Cost: gradient direction is biased by one delta on
-    // each axis, so silhouette shading may look subtly different at the surface band —
-    // often invisible against the noisy density transfer function, but exposed by A/B.
-    float dC = SampleCachedDepth(uvwCenter);
+    // Reduced-tap variant: 4-tap forward differences instead of 6-tap central. Saves 3
+    // texture fetches per buffer per gradient. Cost: gradient direction is biased by one
+    // delta on each axis, but the density transfer function usually masks it.
+    float dCa = SampleCachedDepthA(uvwCenter);
     {
-        float dXp = SampleCachedDepth(saturate(uvwCenter + float3(delta, 0, 0)));
-        float g = dXp - dC;
-        numer   += g * Rl;
-        denomSq += g * g;
+        float dXp = SampleCachedDepthA(saturate(uvwCenter + float3(delta, 0, 0)));
+        float dYp = SampleCachedDepthA(saturate(uvwCenter + float3(0, delta, 0)));
+        float dZp = SampleCachedDepthA(saturate(uvwCenter + float3(0, 0, delta)));
+        gradA_world = (dXp - dCa) * rightA + (dYp - dCa) * upA + (dZp - dCa) * forwardA;
     }
+#ifdef USE_SUB_NYQUIST
+    float dCb = SampleCachedDepthB(uvwCenterB);
     {
-        float dYp = SampleCachedDepth(saturate(uvwCenter + float3(0, delta, 0)));
-        float g = dYp - dC;
-        numer   += g * Ul;
-        denomSq += g * g;
-    }
-    {
-        float dZp = SampleCachedDepth(saturate(uvwCenter + float3(0, 0, delta)));
-        float g = dZp - dC;
-        numer   += g * Fl;
-        denomSq += g * g;
-    }
-#else
-    {
-        float dXp = SampleCachedDepth(saturate(uvwCenter + float3(delta, 0, 0)));
-        float dXm = SampleCachedDepth(saturate(uvwCenter - float3(delta, 0, 0)));
-        float g = dXp - dXm;
-        numer   += g * Rl;
-        denomSq += g * g;
-    }
-    {
-        float dYp = SampleCachedDepth(saturate(uvwCenter + float3(0, delta, 0)));
-        float dYm = SampleCachedDepth(saturate(uvwCenter - float3(0, delta, 0)));
-        float g = dYp - dYm;
-        numer   += g * Ul;
-        denomSq += g * g;
-    }
-    {
-        float dZp = SampleCachedDepth(saturate(uvwCenter + float3(0, 0, delta)));
-        float dZm = SampleCachedDepth(saturate(uvwCenter - float3(0, 0, delta)));
-        float g = dZp - dZm;
-        numer   += g * Fl;
-        denomSq += g * g;
+        float dXp = SampleCachedDepthB(saturate(uvwCenterB + float3(delta, 0, 0)));
+        float dYp = SampleCachedDepthB(saturate(uvwCenterB + float3(0, delta, 0)));
+        float dZp = SampleCachedDepthB(saturate(uvwCenterB + float3(0, 0, delta)));
+        gradB_world = (dXp - dCb) * LightCacheRightAxisB.xyz
+                    + (dYp - dCb) * LightCacheUpAxisB.xyz
+                    + (dZp - dCb) * LightCacheForwardAxisB.xyz;
     }
 #endif
-    return denomSq > 1e-10 ? -numer * rsqrt(denomSq) : fallbackDotL;
+#else
+    {
+        float dXp = SampleCachedDepthA(saturate(uvwCenter + float3(delta, 0, 0)));
+        float dXm = SampleCachedDepthA(saturate(uvwCenter - float3(delta, 0, 0)));
+        float dYp = SampleCachedDepthA(saturate(uvwCenter + float3(0, delta, 0)));
+        float dYm = SampleCachedDepthA(saturate(uvwCenter - float3(0, delta, 0)));
+        float dZp = SampleCachedDepthA(saturate(uvwCenter + float3(0, 0, delta)));
+        float dZm = SampleCachedDepthA(saturate(uvwCenter - float3(0, 0, delta)));
+        gradA_world = (dXp - dXm) * rightA + (dYp - dYm) * upA + (dZp - dZm) * forwardA;
+    }
+#ifdef USE_SUB_NYQUIST
+    {
+        float dXp = SampleCachedDepthB(saturate(uvwCenterB + float3(delta, 0, 0)));
+        float dXm = SampleCachedDepthB(saturate(uvwCenterB - float3(delta, 0, 0)));
+        float dYp = SampleCachedDepthB(saturate(uvwCenterB + float3(0, delta, 0)));
+        float dYm = SampleCachedDepthB(saturate(uvwCenterB - float3(0, delta, 0)));
+        float dZp = SampleCachedDepthB(saturate(uvwCenterB + float3(0, 0, delta)));
+        float dZm = SampleCachedDepthB(saturate(uvwCenterB - float3(0, 0, delta)));
+        gradB_world = (dXp - dXm) * LightCacheRightAxisB.xyz
+                    + (dYp - dYm) * LightCacheUpAxisB.xyz
+                    + (dZp - dZm) * LightCacheForwardAxisB.xyz;
+    }
+#endif
+#endif
+#ifdef USE_SUB_NYQUIST
+    float3 worldGradient = lerp(gradA_world, gradB_world, CacheParameters.w);
+#else
+    float3 worldGradient = gradA_world;
+#endif
+    float denomSq = dot(worldGradient, worldGradient);
+    return denomSq > 1e-10 ? -dot(worldGradient, L) * rsqrt(denomSq) : fallbackDotL;
 }
 
-float3 SampleNormalFromCache(float3 uvwCenter)
+float3 SampleNormalFromCache(float3 uvwCenter, float3 uvwCenterB)
 {
     float delta = 2.0 / max((float)GridResolution(), 1.0);
-    return SampleNormalFromCacheWithDelta(uvwCenter, delta);
+    return SampleNormalFromCacheWithDelta(uvwCenter, uvwCenterB, delta);
 }
 
 float3 CacheGradientNormal(float3 p)
@@ -503,12 +650,24 @@ float3 CacheGradientNormal(float3 p)
     float3 uvwCenter = LightCacheUVWAndFrame(p, right, up, forward);
     if (DispatchParameters.z != 0)
     {
-        float3 encoded = NormalLUT.SampleLevel(LinearClamp, uvwCenter, 0).xyz;
-        float encLen = length(encoded);
-        return encLen > 1e-5 ? encoded / encLen : float3(0, 1, 0);
+        // Two-LUT path: LUT_A snapshots A's normal frame, LUT_B B's frame. Sample
+        // each at its own uvw, then blend in world space with the cache blend
+        // weight. When sub-N is inactive, LUT_B aliases LUT_A and w=0 -> the blend
+        // collapses to LUT_A unchanged.
+        float3 nA = NormalLUT.SampleLevel(LinearClamp, uvwCenter, 0).xyz;
+#ifdef USE_SUB_NYQUIST
+        float3 uvwB = LightCacheUVW_B(p);
+        float3 nB = NormalLUTB.SampleLevel(LinearClamp, uvwB, 0).xyz;
+        float3 blended = lerp(nA, nB, CacheParameters.w);
+#else
+        float3 blended = nA;
+#endif
+        float bl = length(blended);
+        return bl > 1e-5 ? blended / bl : float3(0, 1, 0);
     }
+    float3 uvwCenterB = LightCacheUVW_B(p);
     float delta = 2.0 / max((float)GridResolution(), 1.0);
-    return SampleNormalFromCacheWithFrame(uvwCenter, delta, right, up, forward);
+    return SampleNormalFromCacheWithFrame(uvwCenter, uvwCenterB, delta, right, up, forward);
 }
 
 // Runtime hot-path variant: returns `dot(surfaceNormal, L)` as a single scalar. Same
@@ -525,20 +684,23 @@ float CacheGradientDotLight(float3 p)
     // taken at runtime.
     float3 uvwCenter = LightCacheUVW(p);
     float3 L = normalize(LightDirectionGrid.xyz);
-    float3 encoded = NormalLUT.SampleLevel(LinearClamp, uvwCenter, 0).xyz;
+    float3 nA = NormalLUT.SampleLevel(LinearClamp, uvwCenter, 0).xyz;
+#ifdef USE_SUB_NYQUIST
+    float3 uvwCenterB = LightCacheUVW_B(p);
+    float3 nB = NormalLUTB.SampleLevel(LinearClamp, uvwCenterB, 0).xyz;
+    float3 encoded = lerp(nA, nB, CacheParameters.w);
+#else
+    float3 encoded = nA;
+#endif
     float encLen = length(encoded);
     return encLen > 1e-5 ? dot(encoded, L) / encLen : L.y;
 #else
     float3 right, up, forward;
     float3 uvwCenter = LightCacheUVWAndFrame(p, right, up, forward);
+    float3 uvwCenterB = LightCacheUVW_B(p);
     float3 L = normalize(LightDirectionGrid.xyz);
-    // Project each frame axis onto L once — 3 scalar dot products that die before we
-    // enter the tap loop, so right/up/forward are dead at the depth-tap peak.
-    float Rl = dot(right,   L);
-    float Ul = dot(up,      L);
-    float Fl = dot(forward, L);
     float delta = 2.0 / max((float)GridResolution(), 1.0);
-    return CacheNormalDotLight(uvwCenter, delta, Rl, Ul, Fl, L.y);
+    return CacheNormalDotLight(uvwCenter, uvwCenterB, delta, right, up, forward, L, L.y);
 #endif
 }
 
@@ -582,7 +744,7 @@ float4 TraceVolume(uint2 pixel, bool useCache)
     uint steps=max((uint)ResolutionSteps.z,1u);
 #endif
     float stepLength=(farT-nearT)/steps*VolumeParameters.w, viewT=1.0;
-    float3 scattered=0; float phase=Phase(dot(ray, LightCacheForwardAxis.xyz));
+    float3 scattered=0; float phase=Phase(dot(ray, normalize(LightDirectionGrid.xyz)));
     float rayOffset = InterleavedGradientNoise(float2(pixel));
 #ifdef ENABLE_DISTANCE_FIELD
     bool useDF = DispatchParameters.w != 0
@@ -605,15 +767,6 @@ float4 TraceVolume(uint2 pixel, bool useCache)
     const float dfDim = 128.0;
     const float invDfDim = 1.0 / 128.0;
     float t = nearT + rayOffset * stepLength;
-#ifdef ENABLE_DISTANCE_FIELD
-    // Last-cell DF cache. Across march steps that stay within one DF cell (common on
-    // the first iterations of a fine march inside a partially-empty cell, and on
-    // occupancy-skip returns), the DF value is invariant. Cache it and skip the
-    // Load(). Sentinel int3(-1) forces the first iteration to fetch. Only compiled
-    // when DDA is enabled so the non-DF PSOs pay zero register cost.
-    int3  lastDfCell = int3(-1, -1, -1);
-    float lastDfValue = 0.0;
-#endif
     // Density prefetch state: at the end of each iteration we issue the density fetch for
     // the NEXT iteration's sample position so the texture return latency (dominant LGSB
     // stall in the profile) overlaps with the current iteration's lighting math. Skip
@@ -644,20 +797,7 @@ float4 TraceVolume(uint2 pixel, bool useCache)
             // so their post-skip t values match to within a smooth continuous variation
             // (no accumulated per-pixel step-count divergence).
             uint3 cell = uint3(clamp(uvw * dfDim, 0.0, dfDim - 1.0));
-            // Last-cell cache: if we're still in the same DF cell as the previous
-            // step, reuse the cached value and skip the Load. Big win in tight/dense
-            // regions where fine density-steps stay in one DF cell for many iterations.
-            float dfHere;
-            if (all(int3(cell) == lastDfCell))
-            {
-                dfHere = lastDfValue;
-            }
-            else
-            {
-                dfHere = SampleDistanceFieldCell(int3(cell));
-                lastDfCell  = int3(cell);
-                lastDfValue = dfHere;
-            }
+            float dfHere = SampleDistanceFieldCell(int3(cell));
             if (dfHere > 0.5 * invDfDim)
             {
                 // Determine how many DF cells we can safely walk before needing to sample
@@ -914,8 +1054,10 @@ void ResolveColumnsCS(
     uint waveLane = WaveGetLaneIndex();
     uint waveIndex = groupIndex / waveSize;
     uint waveCount = 256 / waveSize;
-    uint columnIndex = groupId.x * waveCount + waveIndex;
-    bool validColumn = columnIndex < n * n;
+    uint startColumn = (uint)CacheBuildRange.x;
+    uint endColumn = (uint)CacheBuildRange.y;
+    uint columnIndex = startColumn + groupId.x * waveCount + waveIndex;
+    bool validColumn = columnIndex < n * n && columnIndex < endColumn;
     uint2 columnCoordinates = uint2(columnIndex % n, columnIndex / n);
 
     float accumulatedDepth = 0.0;
@@ -1109,6 +1251,17 @@ void NaiveRenderCS(uint3 id:SV_DispatchThreadID, uint3 groupId : SV_GroupID)
 {
     uint2 dims = (uint2)ResolutionSteps.xy;
     if (any(id.xy >= dims)) return;
+    // Temporal reuse early-out. When enabled, TemporalReprojectCS already wrote a
+    // reprojected colour into Output for pixels marked here. Cleared to 0 by the CPU
+    // when temporal reuse is disabled or globally invalidated so this is a no-op.
+    // One R8_UINT load per pixel — negligible next to the trace cost we skip.
+    if (ReuseValidMask[id.xy] != 0u)
+    {
+#ifdef ENABLE_DENSITY_COUNTING
+        SampleCountWrite[id.xy] = 0;
+#endif
+        return;
+    }
     bool classifyEnabled = DispatchParameters.x != 0;
     if (classifyEnabled)
     {
@@ -1142,6 +1295,13 @@ void CachedRenderCS(uint3 id:SV_DispatchThreadID, uint3 groupId : SV_GroupID)
 {
     uint2 dims = (uint2)ResolutionSteps.xy;
     if (any(id.xy >= dims)) return;
+    if (ReuseValidMask[id.xy] != 0u)
+    {
+#ifdef ENABLE_DENSITY_COUNTING
+        SampleCountWrite[id.xy] = 0;
+#endif
+        return;
+    }
     bool classifyEnabled = DispatchParameters.x != 0;
     if (classifyEnabled)
     {
@@ -1377,6 +1537,109 @@ float3 HeatmapColour(float t)
     return c;
 }
 
+// Temporal reprojection: for each pixel, take the current camera's primary ray, find
+// the entry point into the volume bounding box (nearT), then project that world point
+// through the PREVIOUS frame's camera to find the pixel it lived at last frame. If
+// that prev-pixel is in bounds, copy last frame's colour into Output and mark the
+// pixel as reused. Main render entry points early-out on the mask.
+//
+// Ghost-free by design: this is a full-result reuse of a still-valid prior sample;
+// it is NOT a partial-sample accumulation. Global invalidation is handled CPU-side by
+// zero-clearing the mask on any settings/lighting change so this pass never fires
+// unless all we did was move the camera.
+//
+// Sky pixels (no box intersection) are left alone — the trace path's Background()
+// path is cheap enough that we don't gain by reprojecting sky.
+[numthreads(8,8,1)]
+void TemporalReprojectCS(uint3 id : SV_DispatchThreadID)
+{
+    uint2 dims = (uint2)ResolutionSteps.xy;
+    if (any(id.xy >= dims)) return;
+
+    // Reconstruct the current-frame primary ray identically to the render entry
+    // points (must match exactly or reprojection is off by a pixel).
+    float2 dimsF = float2(dims);
+    float2 ndc = ((float2(id.xy) + 0.5) / dimsF) * 2.0 - 1.0;
+    ndc.x *= dimsF.x / dimsF.y;
+    float3 origin = CameraPositionTime.xyz;
+    float3 forward = normalize(CameraTargetMode.xyz - origin);
+    float3 right = normalize(cross(forward, float3(0, 1, 0)));
+    float3 up = cross(right, forward);
+    float3 ray = normalize(forward + ndc.x * right * 0.58 - ndc.y * up * 0.58);
+
+    // Only bother reprojecting rays that hit the volume box. Sky pixels are handled
+    // by the trace shader's cheap Background() path.
+    float nearT, farT;
+    if (!IntersectBox(origin, ray, nearT, farT))
+    {
+        ReuseValidMask[id.xy] = 0u;
+        return;
+    }
+
+    // Reference world point for this pixel: MIDPOINT of the ray's box intersection,
+    // not the entry face. The entry face is a flat rectangle in world space, so
+    // anchoring reprojection there smears the cloud onto that plane whenever the
+    // camera rotates (the parallax between "colour on box front face" and "colour
+    // integrated through the volume" is huge for a volumetric render).
+    //
+    // The midpoint is a cheap proxy for the volume's representative scattering depth
+    // — good enough for most clouds where the bulk of scattering lives near the
+    // volume centre. Not perfect, but the parallax error is small enough that the
+    // reprojection is a net-positive perf win with only a mild edge-fringe artefact
+    // on fast camera swings (which invalidate globally on any settings change anyway).
+    float3 worldRef = origin + ray * ((nearT + farT) * 0.5);
+
+    // Project through the previous frame's camera: mirror the entry-point ray
+    // reconstruction backwards.
+    float3 prevOrigin  = PrevCameraPositionTime.xyz;
+    float3 prevForward = normalize(PrevCameraTargetMode.xyz - prevOrigin);
+    float3 prevRight   = normalize(cross(prevForward, float3(0, 1, 0)));
+    float3 prevUp      = cross(prevRight, prevForward);
+    float3 toWorld     = worldRef - prevOrigin;
+    // Depth along prev forward. Behind the camera → invalid.
+    float prevZ = dot(toWorld, prevForward);
+    if (prevZ <= 1e-4)
+    {
+        ReuseValidMask[id.xy] = 0u;
+        return;
+    }
+    // Inverse of ray = forward + ndc.x*right*0.58 - ndc.y*up*0.58 with the depth
+    // normalisation: project onto the right/up plane at forward-depth.
+    float invScale = 1.0 / (prevZ * 0.58);
+    float prevNdcX = dot(toWorld, prevRight) * invScale;
+    float prevNdcY = -dot(toWorld, prevUp)   * invScale;
+    prevNdcX *= dimsF.y / dimsF.x;
+    // Convert NDC back to pixel space (matching the +0.5 pixel-centre convention).
+    float2 prevUv = float2((prevNdcX * 0.5 + 0.5), (prevNdcY * 0.5 + 0.5));
+    if (any(prevUv < 0.0) || any(prevUv > 1.0))
+    {
+        ReuseValidMask[id.xy] = 0u;
+        return;
+    }
+    // Sample history with LinearClamp — small camera pans move sub-pixel so a
+    // bilinear reprojection is smoother than nearest-neighbour without ghosting
+    // (this is still a fully-resolved history sample, not an accumulation).
+    float4 hist = HistoryColorRead.SampleLevel(LinearClamp, prevUv, 0);
+    Output[id.xy] = hist;
+    ReuseValidMask[id.xy] = 1u;
+}
+
+// Debug overlay: colours pixels by temporal-reuse validity. Runs after the main
+// render. Green = pixel was reprojected from history (skipped the trace). Red =
+// pixel needed a full march. Sky pixels (mask == 0 but never marched) are left alone
+// so the cloud silhouette against the background stays visible.
+[numthreads(8,8,1)]
+void TemporalReuseDebugCS(uint3 id : SV_DispatchThreadID)
+{
+    uint2 dims = (uint2)ResolutionSteps.xy;
+    if (any(id.xy >= dims)) return;
+    uint reused = ReuseValidMask[id.xy];
+    float4 existing = Output[id.xy];
+    float3 tint = reused != 0u ? float3(0.15, 0.9, 0.20)  // green: reused
+                               : float3(0.95, 0.20, 0.15); // red:   marched
+    Output[id.xy] = float4(lerp(existing.rgb, tint, 0.55), existing.a);
+}
+
 [numthreads(8,8,1)]
 void HeatmapDisplayCS(uint3 id : SV_DispatchThreadID)
 {
@@ -1457,6 +1720,40 @@ void BakeOccupancyCS(uint3 id : SV_DispatchThreadID)
     RemappedVolumeMip3Write[id] = maxDensity;
 }
 
+// Per-buffer normal reconstruction used by the two LUT bake entry points. Reads a
+// single physical (A or B) at its own uvw and reconstructs the world-space gradient
+// using that buffer's own frame axes. Called by BakeNormalLUT{A|B}CS, one per
+// physical, so the LUT written by each bake is a snapshot of its own frame.
+float3 NormalFromCacheA(float3 uvw, float delta)
+{
+    float3 rightA, upA, forwardA, cacheMinimum, cacheMaximum;
+    LightCacheFrame(rightA, upA, forwardA, cacheMinimum, cacheMaximum);
+    float dXp = SampleCachedDepthA(saturate(uvw + float3(delta, 0, 0)));
+    float dXm = SampleCachedDepthA(saturate(uvw - float3(delta, 0, 0)));
+    float dYp = SampleCachedDepthA(saturate(uvw + float3(0, delta, 0)));
+    float dYm = SampleCachedDepthA(saturate(uvw - float3(0, delta, 0)));
+    float dZp = SampleCachedDepthA(saturate(uvw + float3(0, 0, delta)));
+    float dZm = SampleCachedDepthA(saturate(uvw - float3(0, 0, delta)));
+    float3 g = (dXp - dXm) * rightA + (dYp - dYm) * upA + (dZp - dZm) * forwardA;
+    float len = length(g);
+    return len > 1e-5 ? -g / len : float3(0, 1, 0);
+}
+
+float3 NormalFromCacheB(float3 uvw, float delta)
+{
+    float dXp = SampleCachedDepthB(saturate(uvw + float3(delta, 0, 0)));
+    float dXm = SampleCachedDepthB(saturate(uvw - float3(delta, 0, 0)));
+    float dYp = SampleCachedDepthB(saturate(uvw + float3(0, delta, 0)));
+    float dYm = SampleCachedDepthB(saturate(uvw - float3(0, delta, 0)));
+    float dZp = SampleCachedDepthB(saturate(uvw + float3(0, 0, delta)));
+    float dZm = SampleCachedDepthB(saturate(uvw - float3(0, 0, delta)));
+    float3 g = (dXp - dXm) * LightCacheRightAxisB.xyz
+             + (dYp - dYm) * LightCacheUpAxisB.xyz
+             + (dZp - dZm) * LightCacheForwardAxisB.xyz;
+    float len = length(g);
+    return len > 1e-5 ? -g / len : float3(0, 1, 0);
+}
+
 [numthreads(4,4,4)]
 void BakeNormalLUTCS(uint3 id : SV_DispatchThreadID)
 {
@@ -1464,10 +1761,19 @@ void BakeNormalLUTCS(uint3 id : SV_DispatchThreadID)
     NormalLUTWrite.GetDimensions(dims.x, dims.y, dims.z);
     if (any(id >= dims)) return;
     float3 uvw = (float3(id) + 0.5) / float3(dims);
-    // Sample the cache using its native grid delta so bake matches the runtime finite-difference.
     float delta = 2.0 / max((float)GridResolution(), 1.0);
-    float3 n = SampleNormalFromCacheWithDelta(uvw, delta);
-    NormalLUTWrite[id] = float4(n, 0.0);
+    NormalLUTWrite[id] = float4(NormalFromCacheA(uvw, delta), 0.0);
+}
+
+[numthreads(4,4,4)]
+void BakeNormalLUTBCS(uint3 id : SV_DispatchThreadID)
+{
+    uint3 dims;
+    NormalLUTWriteB.GetDimensions(dims.x, dims.y, dims.z);
+    if (any(id >= dims)) return;
+    float3 uvw = (float3(id) + 0.5) / float3(dims);
+    float delta = 2.0 / max((float)GridResolution(), 1.0);
+    NormalLUTWriteB[id] = float4(NormalFromCacheB(uvw, delta), 0.0);
 }
 
 // ---------- Empty-space distance field ----------

@@ -1,10 +1,82 @@
-# DX12 Volumetric Raymarching
+# DX12 Raymarching Optimisation Experiments
 
-A Win32 DirectX 12 compute renderer comparing a conventional nested raymarcher with a voxel transmittance cache. The renderer imports `Assets/Altocumlus.vdb` with OpenVDB, presents through Dear ImGui, and records GPU timings with D3D12 timestamp queries.
+This is my learning project for **NVIDIA Nsight Graphics**: build a volumetric raymarcher, use the profiler's bottleneck views to understand where GPU time goes, and measure whether each optimisation actually helps. The goal is to learn the profiling process, not just collect rendering tricks.
 
-## Build
+The application is a Windows C++/DirectX 12 compute renderer using DXC, OpenVDB cloud assets and Dear ImGui. It compares a naive nested shadow raymarch with a precomputed light-space optical-depth cache, with interactive camera, lighting, density and optimisation controls.
 
-Requirements: Windows 10/11, Visual Studio 2022 with the Desktop C++ workload, CMake 3.24+, Git, vcpkg, and a DirectX 12 GPU.
+## Profile first, then optimise
+
+The loop is: capture the same workload in Nsight Graphics, inspect the GPU event timings and bottom-up shader/source views, identify the limiting dependency, change one thing, then compare timing and image quality. DXC embeds shader debug information in optimised builds; PIX markers separate cache construction, raymarching and UI work.
+
+Early captures pointed at repeated shadow marches and density-remapping arithmetic. Once those were removed, the bottleneck moved to texture-fetch dependencies and register pressure limiting occupancy. That distinction matters: fewer instructions, samples or registers do not automatically mean a faster shader. In-app timestamp graphs show raw frame spikes and min/max alongside an exponential moving average (EMA); automated image comparisons help catch quality regressions. Interactive close-ups still matter because a sky-heavy benchmark can hide a regression.
+
+## Approaches that worked
+
+| Optimisation | What changed |
+| --- | --- |
+| Light-aligned optical-depth cache | Integrate density toward the directional light once per cache cell instead of repeating a shadow march at every camera-ray sample. One wave owns a column and uses `WavePrefixSum` to build cumulative optical depth. |
+| Dense, hardware-filtered FP16 cache | Replace pointer/metadata-heavy sparse residual lookups with an `R16_FLOAT` 3D texture. A filtered lookup plus `exp(-depth)` supplies lighting without a local correction march. |
+| Baked density transfer and occupancy | Bake threshold/gamma remapping instead of repeating it in the hot loop. A conservatively pooled, filtered occupancy mip supports empty-space skipping. |
+| Pre-baked normal LUT | Replace repeated finite-difference texture taps with a filtered gradient lookup. Keep normals for the cloud detail rather than removing them purely for speed. |
+| Pipelined density fetches and lazy lighting | Fetch the next sample while processing current lighting, and avoid expensive lighting work when its contribution is negligible. Prefetch improved one interactive comparison from roughly 0.15 to 0.13 ms despite using more registers. |
+| Specialised shader PSOs | Compile out unused normal, LUT, distance-field and debug paths. Sub-Nyquist-off variants also remove the second cache's normal taps and blending instead of retaining a runtime branch. |
+| Sub-Nyquist light-cache updates | For rotating light, build cache poses less frequently and interpolate between them. Matching normal LUTs are baked with the poses; enabling either feature immediately populates valid current/next data. This reduces update frequency, not the cost of an individual rebuild. |
+
+The original linked-cell idea evolved into light-aligned columns: each cell's successor is simply the next cell toward the light. The current dense prefix texture deliberately trades storage for simpler, cheaper sampling. Both rendering modes share the primary density field and shading; the main difference is how they obtain light transmittance.
+
+## Measured performance
+
+**RTX 4090, Release build, 1600 x 900**, `Altocumlus.vdb`, the default reference camera, 180 primary steps and 55 shadow steps. Both modes use the same static light and appearance settings. Results below are median GPU scene-pass times over 300 samples after 1,000 warm-up frames per mode. The capture helper waits for GPU completion between frames to avoid reusing shared descriptors while the cache is being written.
+
+| Mode | GPU scene time | Delta vs naive | Speedup |
+| --- | ---: | ---: | ---: |
+| Naive nested shadow march | 0.670 ms | -- | 1.0x |
+| Fully optimised static-cache path | 0.098 ms | -0.572 ms / -85.3% | 6.8x |
+
+The optimised configuration uses a 256-cubed light cache, a 192-cubed normal LUT, density prefetch and the sub-Nyquist-off PSO. Distance-field skipping, tile classification, temporal reuse, split tracing and amortised rebuilding are off; enabling every checkbox is not the fastest configuration.
+
+These are **raymarch timings, not total frame times**: they exclude UI and cache construction. The separately recorded light-cache build cost was approximately **0.558 ms**; rebuilding every frame would substantially reduce the advantage. Sub-Nyquist interpolation is disabled here for an exact-pose comparison. Readbacks from this same workload achieved mean absolute RGB error **0.043/255** between naive and cached output.
+
+## Cloud gallery
+
+Manually captured in the running application, with ImGui controls and performance graphs visible. The wider views expose an existing background tone-mapping discontinuity at the volume bounds.
+
+### Altocumulus: naive vs optimised
+
+The same medium-distance view and static light, using 180 primary steps, 55 naive shadow steps, a 256-cubed cache and a 192-cubed normal LUT.
+
+| Naive nested shadow march | Optimised transmittance cache |
+| --- | --- |
+| ![Altocumulus medium-distance view with naive lighting](docs/screenshots/altocumulus-medium_naive.png) | ![Altocumulus medium-distance view with optimised cached lighting](docs/screenshots/altocumulus-medium_optimised.png) |
+| GPU scene: **0.960 ms** | GPU scene: **0.216 ms** |
+
+The displayed scene times show approximately **4.4x faster rendering** with similar cloud shading. These are interactive UI readings for this view, not the fixed-camera benchmark medians above; click either image for the full-resolution comparison.
+
+### Altocumulus: distant view looking up
+
+![Altocumulus cloud from a distant low angle with cached lighting](docs/screenshots/altocumulus-far.png)
+
+### Cumulus Congestus: tall cloud structure
+
+![Cumulus Congestus cloud with cached lighting and visible self-shadowing](docs/screenshots/congestus-far.png)
+
+### Cumulus Cloud 1
+
+![Cumulus Cloud 1 from an elevated view with cached lighting](docs/screenshots/cumulus.png)
+
+## Experiments that did not pay off
+
+- **Bit-packed, point-sampled occupancy:** saved memory but produced horizontal skip-boundary streaks; reverted to filtered occupancy.
+- **Two-level sparse residual cache:** worked, but metadata, unpacking and manual interpolation were more expensive than a dense filtered texture.
+- **Tile classification:** reduced sample counts, but pass overhead made the measured gain small or neutral; remains optional.
+- **Removing density prefetch / forcing fewer registers:** hurt interactive performance by exposing texture latency.
+- **Filtered distance-field reads instead of point loads:** increased register pressure and measured time; reverted.
+
+Triple-buffered progressive cache rebuilding is also implemented, but its spike-reduction benefit is not yet established. It remains experimental rather than part of the measured configuration.
+
+## Build and run
+
+Requires Windows 10/11, Visual Studio 2022 with Desktop C++, CMake 3.24+, Git, vcpkg and a DirectX 12 GPU.
 
 ```powershell
 $vcpkg = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\VC\vcpkg"
@@ -15,63 +87,16 @@ cmake --build build-vdb --config Release
 .\build-vdb\Release\DX12Raymarching.exe
 ```
 
-The vcpkg manifest restores OpenVDB and its dependencies. CMake fetches Dear ImGui v1.90.9. Every entry point in `Volume.hlsl` is compiled at build time by DXC to Shader Model 6.0 DXIL. The VDB is copied beside the executable.
+The manifest restores OpenVDB dependencies; CMake fetches Dear ImGui and PIX marker support, compiles Shader Model 6.0 shaders with DXC, and copies the VDB assets beside the executable.
 
-`VdbInspect` runs the same production importer without DX12 and prints the source grid, dense dimensions, page-table dimensions, active brick count, and memory use:
+Select a cloud in **Volume asset**. **F1/F2** switch naive/cached lighting; left-drag orbits and the wheel dollies. The panel exposes density/lighting controls, optimisation toggles, sample-count heatmaps and CPU/GPU graphs.
 
-```powershell
-.\build-vdb\Release\VdbInspect.exe .\Assets\Altocumlus.vdb
-```
-
-## Rendering methods
-
-At startup, OpenVDB selects the `density` `FloatGrid` (or the first float grid), finds its active bounding box, and normalizes its density. It creates:
-
-- A regular filtered `R16_FLOAT` 3D texture, capped at 256 voxels on the longest axis.
-- A sparse 8³-brick grid with an `R32_UINT` 3D page table and compact structured brick pool. Empty VDB regions consume no brick storage.
-
-**Naive mode** samples the regular 3D texture while marching the camera ray. At every non-empty sample it launches a second dense-texture march toward the directional light and integrates optical depth. Its worst-case density work is approximately `primary steps * shadow steps` per pixel.
-
-**Linked cache mode** separates light transport from view rendering:
-
-1. `ResolveColumnsCS` maps the dense VDB into light-aligned columns and integrates every column in one GPU dispatch.
-2. Each hardware wave owns one column and uses `WavePrefixSum` over 32/64-cell chunks. One dispatch replaces the previous sequence of one dispatch and UAV barrier per Z slice.
-3. Each occupied column atomically allocates a compact fine-residual chain spanning its active Z range plus a four-cell interpolation halo.
-4. A dense coarse prefix level stores one cumulative sample every four cells. Compact fine residuals reconstruct full-resolution depth.
-5. Both levels use packed FP16 optical depth; column metadata stores compact-chain offsets and bounds.
-6. `CachedRenderCS` uses the same dense primary-ray sampling as naive mode. A density-variation probe adaptively selects 4–8 local correction samples, then one trilinear two-level lookup supplies cumulative optical depth for the remaining light path.
-
-Segments use two-point Gaussian density integration and half-length boundary segments. Because cache columns are light-aligned, links have no projected-neighbour ambiguity. Empty columns allocate no residual chain, while occupied columns store only their active span plus interpolation halo. The cache is rebuilt when density, extinction, light direction, or grid resolution changes.
-
-## Controls and statistics
-
-Naive mode is the default tuning reference. The ImGui panel exposes the complete appearance pipeline:
-
-- Density gain, threshold, gamma, extinction, scattering, and shadow-density gain.
-- Henyey-Greenstein phase anisotropy, direct-light intensity, approximate multiple scattering, and powder/silver lining.
-- Independent light and ambient colors plus ambient intensity.
-- Exposure, contrast, display gamma, and background intensity.
-- Primary/shadow integration steps, local cache-correction steps/distance, camera, and light direction.
-
-`Dense reference preset` provides an opaque photographic starting point. Density-transfer and shadow controls also invalidate the linked cache so both modes remain comparable. The panel reports imported dense-grid dimensions, original active voxel count, sparse active brick count, and dense/sparse memory.
-
-The supplied tuned values are the application defaults. Press F1/F2 to switch directly between naive and cached lighting. The directional light can rotate around world Y; `Direction to light` controls its starting direction and elevation, while `Light rotation speed` controls signed angular velocity. Cached mode rebuilds its light cache every frame while rotation is enabled.
-
-## Automated parity test
-
-Build and run the in-app DX12 regression without UI automation:
+For the fixed-camera image/timing regression:
 
 ```powershell
 cmake --build build-vdb --config Release --target RunCacheParity
 ```
 
-The hidden test renders fixed naive and cached sequences, reads the renderer output texture back through DX12, writes `cache-test-results/naive.ppm`, `cached.ppm`, and `report.json`, then fails unless cached mode has mean RGB error at most `1.0` and is at least 5% faster. The report includes occupied and compact residual cell counts, allocated cache memory, cache-build time, and render speedup.
+It writes PPM captures and `report.json` to `cache-test-results` in its working directory. Passing requires mean RGB error at most 1.0/255 and cached scene rendering at least 5% faster. It disables light rotation and temporal cache interpolation so the comparison uses matching poses.
 
-Over the scene, left-drag controls camera yaw/pitch and disables automatic orbit. The mouse wheel controls distance from 0 to 20, allowing the camera to move inside the VDB; a small internal epsilon keeps the view direction defined at zero.
-
-## Current tradeoffs
-
-- The cache targets one directional light. Multiple or local lights need separate caches or a different parameterization.
-- Light-aligned columns produce exact one-cell successor links for the directional light, but changing the light direction requires rebuilding the oriented cache.
-- The sparse density grid uses fixed 8³ bricks. NanoVDB or a GPU-native VDB tree could reduce page-table and brick-boundary overhead further.
-- Cache construction is intentionally synchronous in the graphics queue for clarity. A production renderer could rebuild asynchronously and double-buffer the cache.
+The cache currently targets one directional light. Multiple/local lights and asynchronous compute scheduling are outside this experiment's scope.

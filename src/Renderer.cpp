@@ -246,7 +246,11 @@ bool Renderer::CreateCoreResources()
     }
 
     auto uploadHeap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
-    auto constantsDescription = BufferDescription(FrameCount * ConstantStride);
+    // Three CBV slots per frame: scene (b0 for the render pass), build (b0 for
+    // the primary cache-build dispatch, may hold a predictive-target light dir),
+    // and seedB-build (b0 for the second cache-build dispatch on sub-Nyquist
+    // toggle-on, holding the look-ahead direction to populate physical B).
+    auto constantsDescription = BufferDescription(FrameCount * ConstantStride * 3);
     if (Failed(m_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &constantsDescription,
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_constantBuffer))) ||
         Failed(m_constantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&m_constantData))))
@@ -439,6 +443,47 @@ bool Renderer::CreateSizeDependentResources()
     m_device->CreateUnorderedAccessView(m_sampleCountTexture.Get(), nullptr, &sampleCountUav,
         CpuHandle(SampleCountUav));
 
+    // Temporal reuse: R8_UINT per-pixel reuse marker (1 = pixel filled from history,
+    // 0 = pixel needs marching this frame). Cleared to 0 each frame; TemporalReprojectCS
+    // fills valid pixels and writes 1 here + colour into Output.
+    D3D12_RESOURCE_DESC reuseDescription = textureDescription;
+    reuseDescription.Format = DXGI_FORMAT_R8_UINT;
+    if (Failed(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+        &reuseDescription, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(m_reuseValidTexture.ReleaseAndGetAddressOf()))))
+    {
+        SetError("Failed to create reuse-validity texture.");
+        return false;
+    }
+    m_reuseValidState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC reuseUav{};
+    reuseUav.Format = DXGI_FORMAT_R8_UINT;
+    reuseUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    m_device->CreateUnorderedAccessView(m_reuseValidTexture.Get(), nullptr, &reuseUav,
+        CpuHandle(ReuseValidUav));
+
+    // Temporal reuse: history colour target. Matches Output format so we can CopyResource
+    // the two directly. Starts in COPY_DEST; transitioned to NON_PIXEL_SHADER_RESOURCE for
+    // sampling by TemporalReprojectCS.
+    D3D12_RESOURCE_DESC historyDescription = textureDescription;
+    historyDescription.Flags = D3D12_RESOURCE_FLAG_NONE;
+    if (Failed(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+        &historyDescription, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        IID_PPV_ARGS(m_historyColorTexture.ReleaseAndGetAddressOf()))))
+    {
+        SetError("Failed to create history colour texture.");
+        return false;
+    }
+    m_historyColorState = D3D12_RESOURCE_STATE_COPY_DEST;
+    D3D12_SHADER_RESOURCE_VIEW_DESC historySrv{};
+    historySrv.Format = historyDescription.Format;
+    historySrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    historySrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    historySrv.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_historyColorTexture.Get(), &historySrv,
+        CpuHandle(HistoryColorSrv));
+    m_temporalHistoryValid = false;
+
     return true;
 }
 
@@ -483,6 +528,20 @@ bool Renderer::CreateVolumeResources(uint32_t resolution)
         IID_PPV_ARGS(&m_transmittanceBuffer))))
     {
         SetError("Failed to create cached depth texture.");
+        return false;
+    }
+    if (Failed(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+        &coarseDepthDescription, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(&m_transmittanceBufferB))))
+    {
+        SetError("Failed to create cached depth texture B.");
+        return false;
+    }
+    if (Failed(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+        &coarseDepthDescription, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(&m_transmittanceBufferC))))
+    {
+        SetError("Failed to create cached depth texture C.");
         return false;
     }
 
@@ -537,11 +596,24 @@ bool Renderer::CreateVolumeResources(uint32_t resolution)
     coarseSrv.Texture3D.MipLevels = 1;
     m_device->CreateShaderResourceView(m_transmittanceBuffer.Get(), &coarseSrv,
         CpuHandle(TransmittanceSrv));
+    // Buffer B SRV slot (t11 in the shader). Feature-off default: point at A so
+    // shader lerp(A, B, 0) is bit-exact identical to reading A alone. When
+    // sub-Nyquist is enabled and B has been populated, this descriptor is
+    // rewritten to point at m_transmittanceBufferB.
+    m_device->CreateShaderResourceView(m_transmittanceBuffer.Get(), &coarseSrv,
+        CpuHandle(TransmittanceSrvB));
 
-    m_densityState = m_linksState = m_transmittanceState = m_statsState =
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_densityState = m_linksState = m_transmittanceState = m_transmittanceStateB =
+        m_transmittanceStateC =
+        m_statsState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_cacheBothPopulated = false;
+    m_cacheHasValidB = false;
+    m_cacheOldPhysical = 0;
+    m_cacheBlend = 0.0f;
+    ResetAmortizedCacheState();
+    m_subNyquistWasEnabled = false;
     m_stats.totalCells = cells;
-    m_stats.cacheBytes = cellCount * sizeof(uint16_t) +
+    m_stats.cacheBytes = cellCount * sizeof(uint16_t) * 3ull +
         m_volumeData.denseHalf.size() * sizeof(uint16_t) +
         m_volumeData.pageTable.size() * sizeof(uint32_t) +
         m_volumeData.brickPool.size() * sizeof(float);
@@ -837,11 +909,32 @@ bool Renderer::CreateNormalLUT(uint32_t resolution)
         SetError("Failed to create normal LUT texture.");
         return false;
     }
+    m_normalLUTTextureB.Reset();
+    if (Failed(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+        &description, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(&m_normalLUTTextureB))))
+    {
+        SetError("Failed to create normal LUT B texture.");
+        return false;
+    }
+    m_normalLUTTextureC.Reset();
+    if (Failed(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+        &description, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(&m_normalLUTTextureC))))
+    {
+        SetError("Failed to create normal LUT C texture.");
+        return false;
+    }
     m_normalLUTState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_normalLUTStateB = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_normalLUTStateC = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     m_normalLUTResolution = clamped;
     m_normalLUTBaked = false;
+    m_normalLUTBBaked = false;
+    m_normalLUTBValid = false;
+    m_normalLUTBakedSlots = {};
     m_stats.normalLUTBytes =
-        static_cast<uint64_t>(clamped) * clamped * clamped * 4ull; // R8G8B8A8_SNORM
+        static_cast<uint64_t>(clamped) * clamped * clamped * 4ull * 3ull; // A + B + C
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
@@ -850,6 +943,8 @@ bool Renderer::CreateNormalLUT(uint32_t resolution)
     uav.Texture3D.WSize = clamped;
     m_device->CreateUnorderedAccessView(m_normalLUTTexture.Get(), nullptr, &uav,
         CpuHandle(NormalLUTUav));
+    m_device->CreateUnorderedAccessView(m_normalLUTTextureB.Get(), nullptr, &uav,
+        CpuHandle(NormalLUTBUav));
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -858,6 +953,12 @@ bool Renderer::CreateNormalLUT(uint32_t resolution)
     srv.Format = DXGI_FORMAT_R8G8B8A8_SNORM;
     m_device->CreateShaderResourceView(m_normalLUTTexture.Get(), &srv,
         CpuHandle(NormalLUTSrv));
+    // LUT_B SRV initially aliases LUT_A (identical descriptor) so that runtime
+    // sampling of NormalLUTB with blend weight=0 returns the same as LUT_A. On
+    // the first bake into LUT_B (sub-Nyquist cross-fade), we recreate this SRV
+    // to point at the real B resource — matches the CachedDepthReadB pattern.
+    m_device->CreateShaderResourceView(m_normalLUTTexture.Get(), &srv,
+        CpuHandle(NormalLUTSrvB));
     return true;
 }
 
@@ -865,11 +966,11 @@ bool Renderer::CreatePipelines()
 {
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[0].NumDescriptors = 15;
+    ranges[0].NumDescriptors = 17;
     ranges[0].BaseShaderRegister = 0;
     ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[1].NumDescriptors = 10;
+    ranges[1].NumDescriptors = 13;
     ranges[1].BaseShaderRegister = 0;
     ranges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -925,6 +1026,10 @@ bool Renderer::CreatePipelines()
         { "CachedRenderLutCS", &m_cachedLutPso },
         { "CachedRenderDFCS", &m_cachedDfPso },
         { "CachedRenderDFLutCS", &m_cachedDfLutPso },
+        { "CachedRenderNoSubNCS", &m_cachedNoSubNPso },
+        { "CachedRenderLutNoSubNCS", &m_cachedLutNoSubNPso },
+        { "CachedRenderDFNoSubNCS", &m_cachedDfNoSubNPso },
+        { "CachedRenderDFLutNoSubNCS", &m_cachedDfLutNoSubNPso },
         { "CachedRenderNoSNCS", &m_cachedNoSNPso },
         { "CachedRenderLutNoSNCS", &m_cachedLutNoSNPso },
         { "CachedRenderDFNoSNCS", &m_cachedDfNoSNPso },
@@ -944,11 +1049,14 @@ bool Renderer::CreatePipelines()
         { "CachedRenderDFReducedTapCountCS", &m_cachedDfReducedTapCountPso },
         { "NaiveRenderCountCS", &m_naiveCountPso },
         { "HeatmapDisplayCS", &m_heatmapDisplayPso },
+        { "TemporalReprojectCS", &m_temporalReprojectPso },
+        { "TemporalReuseDebugCS", &m_temporalReuseDebugPso },
         { "BakeRemappedVolumeCS", &m_bakeRemappedPso },
         { "BakeOccupancyCS", &m_bakeOccupancyPso },
         { "ClassifyTilesCS", &m_classifyTilesPso },
         { "DebugTileOverlayCS", &m_debugTileOverlayPso },
         { "BakeNormalLUTCS", &m_bakeNormalLUTPso },
+        { "BakeNormalLUTBCS", &m_bakeNormalLUTBPso },
         { "BakeDistanceFieldInitCS", &m_bakeDistanceFieldInitPso },
         { "BakeDistanceFieldPropagateCS", &m_bakeDistanceFieldPropagatePso },
         { "DebugDistanceFieldCS", &m_debugDistanceFieldPso },
@@ -1025,9 +1133,243 @@ void Renderer::UavBarrier(ID3D12Resource* resource)
     m_commandList->ResourceBarrier(1, &barrier);
 }
 
-void Renderer::PopulateConstants(const RenderSettings& settings, float timeSeconds)
+ID3D12Resource* Renderer::PhysicalCache(uint32_t slot) const
 {
-    float yaw = settings.cameraYaw + (settings.autoOrbit ? timeSeconds * 0.18f : 0.0f);
+    switch (slot)
+    {
+    case 1: return m_transmittanceBufferB.Get();
+    case 2: return m_transmittanceBufferC.Get();
+    default: return m_transmittanceBuffer.Get();
+    }
+}
+
+ID3D12Resource* Renderer::PhysicalNormalLUT(uint32_t slot) const
+{
+    switch (slot)
+    {
+    case 1: return m_normalLUTTextureB.Get();
+    case 2: return m_normalLUTTextureC.Get();
+    default: return m_normalLUTTexture.Get();
+    }
+}
+
+D3D12_RESOURCE_STATES& Renderer::PhysicalCacheState(uint32_t slot)
+{
+    switch (slot)
+    {
+    case 1: return m_transmittanceStateB;
+    case 2: return m_transmittanceStateC;
+    default: return m_transmittanceState;
+    }
+}
+
+D3D12_RESOURCE_STATES& Renderer::PhysicalNormalLUTState(uint32_t slot)
+{
+    switch (slot)
+    {
+    case 1: return m_normalLUTStateB;
+    case 2: return m_normalLUTStateC;
+    default: return m_normalLUTState;
+    }
+}
+
+DirectX::XMFLOAT3 Renderer::RotateLightByThreshold(const DirectX::XMFLOAT3& lightDir,
+    float thresholdRad, const RenderSettings& settings) const
+{
+    if (!settings.rotateLight)
+        return lightDir;
+    const float direction = settings.lightRotationSpeed >= 0.0f ? 1.0f : -1.0f;
+    const float rotAngle = thresholdRad * direction;
+    const float c = std::cos(rotAngle);
+    const float s = std::sin(rotAngle);
+    return {
+        lightDir.x * c + lightDir.z * s,
+        lightDir.y,
+        -lightDir.x * s + lightDir.z * c
+    };
+}
+
+void Renderer::ResetAmortizedCacheState()
+{
+    m_slotDisplayA = 0;
+    m_slotDisplayB = 1;
+    m_slotBuild = 2;
+    m_buildColumnCursor = 0;
+    m_buildColumnsPerFrame = 0;
+    m_buildActive = false;
+    m_buildComplete = false;
+    m_pendingProgressiveBuild = false;
+    m_pendingCacheSwap = false;
+}
+
+void Renderer::RebindCacheDescriptors()
+{
+    if (!m_device || !m_transmittanceBuffer || !m_normalLUTTexture)
+        return;
+
+    const uint32_t displayASlot = static_cast<uint32_t>(std::clamp(m_slotDisplayA, 0, 2));
+    const uint32_t displayBSlot = m_cacheBothPopulated
+        ? static_cast<uint32_t>(std::clamp(m_slotDisplayB, 0, 2))
+        : displayASlot;
+    const uint32_t buildSlot = static_cast<uint32_t>(std::clamp(m_slotBuild, 0, 2));
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC coarseUav{};
+    coarseUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+    coarseUav.Format = DXGI_FORMAT_R16_FLOAT;
+    coarseUav.Texture3D.WSize = static_cast<UINT>(m_gridResolution);
+    m_device->CreateUnorderedAccessView(PhysicalCache(buildSlot), nullptr, &coarseUav,
+        CpuHandle(TransmittanceUav));
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC coarseSrv{};
+    coarseSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    coarseSrv.Format = DXGI_FORMAT_R16_FLOAT;
+    coarseSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    coarseSrv.Texture3D.MipLevels = 1;
+    m_device->CreateShaderResourceView(PhysicalCache(displayASlot), &coarseSrv,
+        CpuHandle(TransmittanceSrv));
+    m_device->CreateShaderResourceView(PhysicalCache(displayBSlot), &coarseSrv,
+        CpuHandle(TransmittanceSrvB));
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC lutUav{};
+    lutUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+    lutUav.Format = DXGI_FORMAT_R8G8B8A8_SNORM;
+    lutUav.Texture3D.MipSlice = 0;
+    lutUav.Texture3D.WSize = m_normalLUTResolution;
+    m_device->CreateUnorderedAccessView(PhysicalNormalLUT(displayASlot), nullptr, &lutUav,
+        CpuHandle(NormalLUTUav));
+    m_device->CreateUnorderedAccessView(PhysicalNormalLUT(displayBSlot), nullptr, &lutUav,
+        CpuHandle(NormalLUTBUav));
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC lutSrv{};
+    lutSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    lutSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    lutSrv.Texture3D.MipLevels = 1;
+    lutSrv.Format = DXGI_FORMAT_R8G8B8A8_SNORM;
+    m_device->CreateShaderResourceView(PhysicalNormalLUT(displayASlot), &lutSrv,
+        CpuHandle(NormalLUTSrv));
+    m_device->CreateShaderResourceView(PhysicalNormalLUT(displayBSlot), &lutSrv,
+        CpuHandle(NormalLUTSrvB));
+}
+
+void Renderer::FillLightConstants(ShaderConstants& constants,
+                                  const DirectX::XMFLOAT3& lightDir) const
+{
+    constants.lightDirectionGrid = { lightDir.x, lightDir.y, lightDir.z,
+        static_cast<float>(m_gridResolution) };
+
+    DirectX::XMVECTOR fwd = DirectX::XMVector3Normalize(
+        DirectX::XMVectorSet(lightDir.x, lightDir.y, lightDir.z, 0.0f));
+    DirectX::XMFLOAT3 fwdF; DirectX::XMStoreFloat3(&fwdF, fwd);
+    DirectX::XMVECTOR reference = (std::fabs(fwdF.y) < 0.99f)
+        ? DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f)
+        : DirectX::XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+    DirectX::XMVECTOR right = DirectX::XMVector3Normalize(
+        DirectX::XMVector3Cross(reference, fwd));
+    DirectX::XMVECTOR up = DirectX::XMVector3Cross(fwd, right);
+
+    DirectX::XMFLOAT3 rightF, upF;
+    DirectX::XMStoreFloat3(&rightF, right);
+    DirectX::XMStoreFloat3(&upF, up);
+
+    const float halfX = (m_volumeData.boundsMax.x - m_volumeData.boundsMin.x) * 0.5f;
+    const float halfY = (m_volumeData.boundsMax.y - m_volumeData.boundsMin.y) * 0.5f;
+    const float halfZ = (m_volumeData.boundsMax.z - m_volumeData.boundsMin.z) * 0.5f;
+    const float centerX = (m_volumeData.boundsMin.x + m_volumeData.boundsMax.x) * 0.5f;
+    const float centerY = (m_volumeData.boundsMin.y + m_volumeData.boundsMax.y) * 0.5f;
+    const float centerZ = (m_volumeData.boundsMin.z + m_volumeData.boundsMax.z) * 0.5f;
+
+    auto pack = [&](const DirectX::XMFLOAT3& axis, DirectX::XMFLOAT4& scaled,
+                    DirectX::XMFLOAT4& plain)
+    {
+        const float invExtent = 1.0f / std::max(2.0f * (std::fabs(axis.x) * halfX
+            + std::fabs(axis.y) * halfY + std::fabs(axis.z) * halfZ), 1e-8f);
+        const float centerDot = axis.x * centerX + axis.y * centerY + axis.z * centerZ;
+        scaled = { axis.x * invExtent, axis.y * invExtent, axis.z * invExtent,
+            0.5f - centerDot * invExtent };
+        plain  = { axis.x, axis.y, axis.z, 0.0f };
+    };
+    pack(rightF, constants.lightCacheRightScaled,   constants.lightCacheRightAxis);
+    pack(upF,    constants.lightCacheUpScaled,      constants.lightCacheUpAxis);
+    pack(fwdF,   constants.lightCacheForwardScaled, constants.lightCacheForwardAxis);
+
+    // Default B-axes mirror A. Sub-Nyquist path overrides via
+    // FillLightCacheAxesB when A and B were baked at different directions.
+    constants.lightCacheRightScaledB   = constants.lightCacheRightScaled;
+    constants.lightCacheUpScaledB      = constants.lightCacheUpScaled;
+    constants.lightCacheForwardScaledB = constants.lightCacheForwardScaled;
+    constants.lightCacheRightAxisB     = constants.lightCacheRightAxis;
+    constants.lightCacheUpAxisB        = constants.lightCacheUpAxis;
+    constants.lightCacheForwardAxisB   = constants.lightCacheForwardAxis;
+}
+
+void Renderer::FillLightCacheAxesB(ShaderConstants& constants,
+                                   const DirectX::XMFLOAT3& lightDirB) const
+{
+    DirectX::XMVECTOR fwd = DirectX::XMVector3Normalize(
+        DirectX::XMVectorSet(lightDirB.x, lightDirB.y, lightDirB.z, 0.0f));
+    DirectX::XMFLOAT3 fwdF; DirectX::XMStoreFloat3(&fwdF, fwd);
+    DirectX::XMVECTOR reference = (std::fabs(fwdF.y) < 0.99f)
+        ? DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f)
+        : DirectX::XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+    DirectX::XMVECTOR right = DirectX::XMVector3Normalize(
+        DirectX::XMVector3Cross(reference, fwd));
+    DirectX::XMVECTOR up = DirectX::XMVector3Cross(fwd, right);
+
+    DirectX::XMFLOAT3 rightF, upF;
+    DirectX::XMStoreFloat3(&rightF, right);
+    DirectX::XMStoreFloat3(&upF, up);
+
+    const float halfX = (m_volumeData.boundsMax.x - m_volumeData.boundsMin.x) * 0.5f;
+    const float halfY = (m_volumeData.boundsMax.y - m_volumeData.boundsMin.y) * 0.5f;
+    const float halfZ = (m_volumeData.boundsMax.z - m_volumeData.boundsMin.z) * 0.5f;
+    const float centerX = (m_volumeData.boundsMin.x + m_volumeData.boundsMax.x) * 0.5f;
+    const float centerY = (m_volumeData.boundsMin.y + m_volumeData.boundsMax.y) * 0.5f;
+    const float centerZ = (m_volumeData.boundsMin.z + m_volumeData.boundsMax.z) * 0.5f;
+
+    auto pack = [&](const DirectX::XMFLOAT3& axis, DirectX::XMFLOAT4& scaled)
+    {
+        const float invExtent = 1.0f / std::max(2.0f * (std::fabs(axis.x) * halfX
+            + std::fabs(axis.y) * halfY + std::fabs(axis.z) * halfZ), 1e-8f);
+        const float centerDot = axis.x * centerX + axis.y * centerY + axis.z * centerZ;
+        scaled = { axis.x * invExtent, axis.y * invExtent, axis.z * invExtent,
+            0.5f - centerDot * invExtent };
+    };
+    pack(rightF, constants.lightCacheRightScaledB);
+    pack(upF,    constants.lightCacheUpScaledB);
+    pack(fwdF,   constants.lightCacheForwardScaledB);
+    constants.lightCacheRightAxisB   = { rightF.x, rightF.y, rightF.z, 0.0f };
+    constants.lightCacheUpAxisB      = { upF.x,    upF.y,    upF.z,    0.0f };
+    constants.lightCacheForwardAxisB = { fwdF.x,   fwdF.y,   fwdF.z,   0.0f };
+}
+
+void Renderer::PopulateConstants(RenderSettings& settings, float timeSeconds)
+{
+    // Advance per-toggle motion accumulators by the real delta since the last frame,
+    // gated on the corresponding tickbox. This makes the effective angle continuous
+    // across enable/disable — no visible jump when the user re-enables auto-orbit or
+    // light rotation after it's been off for a while.
+    float dt = 0.0f;
+    if (m_hasLastFrameTime)
+        dt = std::max(0.0f, timeSeconds - m_lastFrameTimeSeconds);
+    m_lastFrameTimeSeconds = timeSeconds;
+    m_hasLastFrameTime = true;
+    if (settings.autoOrbit)
+        m_orbitAccumulator += dt;
+    // Light rotation drives the yaw of `settings.lightDirection` directly, so
+    // the ImGui yaw slider tracks the current position and un-ticking rotate
+    // simply leaves the direction where it landed (no jump, no snap-back).
+    if (settings.rotateLight && dt > 0.0f)
+    {
+        const float angle = dt * settings.lightRotationSpeed;
+        const float c = std::cos(angle);
+        const float s = std::sin(angle);
+        const float nx =  settings.lightDirection.x * c + settings.lightDirection.z * s;
+        const float nz = -settings.lightDirection.x * s + settings.lightDirection.z * c;
+        settings.lightDirection.x = nx;
+        settings.lightDirection.z = nz;
+    }
+
+    float yaw = settings.cameraYaw + (settings.autoOrbit ? m_orbitAccumulator * 0.18f : 0.0f);
     float cp = std::cos(settings.cameraPitch);
     const float effectiveDistance = std::max(settings.cameraDistance, 0.001f);
     DirectX::XMFLOAT3 camera{
@@ -1037,18 +1379,6 @@ void Renderer::PopulateConstants(const RenderSettings& settings, float timeSecon
     };
 
     DirectX::XMVECTOR light = DirectX::XMLoadFloat3(&settings.lightDirection);
-    if (settings.rotateLight)
-    {
-        const float angle = timeSeconds * settings.lightRotationSpeed;
-        const float cosine = std::cos(angle);
-        const float sine = std::sin(angle);
-        const DirectX::XMFLOAT3 base = settings.lightDirection;
-        light = DirectX::XMVectorSet(
-            base.x * cosine + base.z * sine,
-            base.y,
-            -base.x * sine + base.z * cosine,
-            0.0f);
-    }
     if (DirectX::XMVectorGetX(DirectX::XMVector3LengthSq(light)) < 1e-5f)
         light = DirectX::XMVectorSet(0.45f, 0.8f, -0.35f, 0.0f);
     light = DirectX::XMVector3Normalize(light);
@@ -1059,12 +1389,57 @@ void Renderer::PopulateConstants(const RenderSettings& settings, float timeSecon
     ShaderConstants constants{};
     constants.cameraPositionTime = { camera.x, camera.y, camera.z, timeSeconds };
     constants.cameraTargetMode = { 0.0f, 0.0f, 0.0f, settings.debugVoxels ? 1.0f : 0.0f };
+    // Motion-adaptive step scaling. When enabled and any camera/light motion is
+    // detected this frame, use fewer, coarser steps. stepScale is bumped in inverse
+    // proportion so per-frame volume coverage stays the same. Motion perceptually
+    // masks the coarser sampling.
+    int effectivePrimarySteps = settings.primarySteps;
+    int effectiveShadowSteps = settings.shadowSteps;
+    float effectiveStepScale = settings.stepScale;
+    if (settings.motionAdaptiveSteps)
+    {
+        float camDelta = 0.0f;
+        float lightDelta = 0.0f;
+        if (m_motionHasReference)
+        {
+            camDelta = std::fabs(settings.cameraYaw - m_motionPrevYaw)
+                     + std::fabs(settings.cameraPitch - m_motionPrevPitch)
+                     + std::fabs(settings.cameraDistance - m_motionPrevDistance) * 0.5f;
+            const DirectX::XMVECTOR l0 = DirectX::XMLoadFloat3(&m_motionPrevLightDir);
+            const DirectX::XMVECTOR l1 = DirectX::XMLoadFloat3(&normalizedLight);
+            const float dot01 = std::clamp(
+                DirectX::XMVectorGetX(DirectX::XMVector3Dot(l0, l1)), -1.0f, 1.0f);
+            lightDelta = 1.0f - dot01;
+        }
+        const bool inMotion = camDelta > 0.001f || lightDelta > 0.0001f
+            || settings.autoOrbit || settings.rotateLight;
+        if (inMotion)
+        {
+            constexpr float scale = 0.7f;
+            effectivePrimarySteps = std::max(1,
+                static_cast<int>(std::round(settings.primarySteps * scale)));
+            effectiveShadowSteps = std::max(1,
+                static_cast<int>(std::round(settings.shadowSteps * scale)));
+            effectiveStepScale = settings.stepScale *
+                static_cast<float>(settings.primarySteps) /
+                static_cast<float>(effectivePrimarySteps);
+        }
+        m_motionPrevYaw = settings.cameraYaw;
+        m_motionPrevPitch = settings.cameraPitch;
+        m_motionPrevDistance = settings.cameraDistance;
+        m_motionPrevLightDir = normalizedLight;
+        m_motionHasReference = true;
+    }
+    else
+    {
+        m_motionHasReference = false;
+    }
     constants.resolutionSteps = { static_cast<float>(m_width), static_cast<float>(m_height),
-        static_cast<float>(settings.primarySteps), static_cast<float>(settings.shadowSteps) };
+        static_cast<float>(effectivePrimarySteps), static_cast<float>(effectiveShadowSteps) };
     constants.volumeParameters = { settings.densityScale, settings.extinction,
-        settings.scattering, settings.stepScale };
-    constants.lightDirectionGrid = { normalizedLight.x, normalizedLight.y, normalizedLight.z,
-        static_cast<float>(m_gridResolution) };
+        settings.scattering, effectiveStepScale };
+    // lightDirectionGrid + lightCache*Scaled/Axis are populated at end of function
+    // via FillLightConstants (once for scene, optionally again for predictive build).
     constants.volumeMin = { m_volumeData.boundsMin.x, m_volumeData.boundsMin.y,
         m_volumeData.boundsMin.z, 0.0f };
     constants.volumeMax = { m_volumeData.boundsMax.x, m_volumeData.boundsMax.y,
@@ -1088,48 +1463,319 @@ void Renderer::PopulateConstants(const RenderSettings& settings, float timeSecon
     const float sizeX = std::max(m_volumeData.boundsMax.x - m_volumeData.boundsMin.x, 1e-6f);
     const float sizeY = std::max(m_volumeData.boundsMax.y - m_volumeData.boundsMin.y, 1e-6f);
     const float sizeZ = std::max(m_volumeData.boundsMax.z - m_volumeData.boundsMin.z, 1e-6f);
-    constants.cacheParameters = { 1.0f / sizeX, 1.0f / sizeY, 1.0f / sizeZ, 0.0f };
+    constants.cacheParameters = { 1.0f / sizeX, 1.0f / sizeY, 1.0f / sizeZ, m_cacheBlend };
 
-    // ---- Precompute light-cache frame ------------------------------------------
-    // Matches LightCacheFrame() in shaders/Volume.hlsl. Doing this on CPU strips
-    // ~9 scalars of live registers from LightCacheUVW / LightCacheUVWAndFrame
-    // (previously kept right/up/forward + volumeCenter + volumeHalfExtent alive).
+    // Scene-frame light constants (based on current effective light direction).
+    FillLightConstants(constants, normalizedLight);
+
+    // Temporal reuse: prev-frame camera pose feeds TemporalReprojectCS. On first frame
+    // (m_temporalHistoryValid==false), set to current pose so reprojection is identity;
+    // the CPU-side history-valid gate ensures the reproject dispatch is skipped anyway.
+    if (m_temporalHistoryValid)
     {
-        DirectX::XMVECTOR fwd = DirectX::XMVector3Normalize(
-            DirectX::XMVectorSet(normalizedLight.x, normalizedLight.y, normalizedLight.z, 0.0f));
-        DirectX::XMFLOAT3 fwdF; DirectX::XMStoreFloat3(&fwdF, fwd);
-        DirectX::XMVECTOR reference = (std::fabs(fwdF.y) < 0.99f)
-            ? DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f)
-            : DirectX::XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
-        DirectX::XMVECTOR right = DirectX::XMVector3Normalize(DirectX::XMVector3Cross(reference, fwd));
-        DirectX::XMVECTOR up    = DirectX::XMVector3Cross(fwd, right);
-
-        DirectX::XMFLOAT3 rightF, upF;
-        DirectX::XMStoreFloat3(&rightF, right);
-        DirectX::XMStoreFloat3(&upF, up);
-
-        const float halfX = (m_volumeData.boundsMax.x - m_volumeData.boundsMin.x) * 0.5f;
-        const float halfY = (m_volumeData.boundsMax.y - m_volumeData.boundsMin.y) * 0.5f;
-        const float halfZ = (m_volumeData.boundsMax.z - m_volumeData.boundsMin.z) * 0.5f;
-        const float centerX = (m_volumeData.boundsMin.x + m_volumeData.boundsMax.x) * 0.5f;
-        const float centerY = (m_volumeData.boundsMin.y + m_volumeData.boundsMax.y) * 0.5f;
-        const float centerZ = (m_volumeData.boundsMin.z + m_volumeData.boundsMax.z) * 0.5f;
-
-        auto pack = [&](const DirectX::XMFLOAT3& axis, DirectX::XMFLOAT4& scaled, DirectX::XMFLOAT4& plain)
-        {
-            const float invExtent = 1.0f / std::max(2.0f * (std::fabs(axis.x) * halfX
-                + std::fabs(axis.y) * halfY + std::fabs(axis.z) * halfZ), 1e-8f);
-            const float centerDot = axis.x * centerX + axis.y * centerY + axis.z * centerZ;
-            scaled = { axis.x * invExtent, axis.y * invExtent, axis.z * invExtent,
-                0.5f - centerDot * invExtent };
-            plain  = { axis.x, axis.y, axis.z, 0.0f };
-        };
-        pack(rightF, constants.lightCacheRightScaled,   constants.lightCacheRightAxis);
-        pack(upF,    constants.lightCacheUpScaled,      constants.lightCacheUpAxis);
-        pack(fwdF,   constants.lightCacheForwardScaled, constants.lightCacheForwardAxis);
+        constants.prevCameraPositionTime = m_prevCameraPositionTime;
+        constants.prevCameraTargetMode = m_prevCameraTargetMode;
     }
+    else
+    {
+        constants.prevCameraPositionTime = constants.cameraPositionTime;
+        constants.prevCameraTargetMode = constants.cameraTargetMode;
+    }
+    // Cache the current pose for next frame.
+    m_prevCameraPositionTime = constants.cameraPositionTime;
+    m_prevCameraTargetMode = constants.cameraTargetMode;
 
-    std::memcpy(m_constantData + m_frameIndex * ConstantStride, &constants, sizeof(constants));
+    // ---- Sub-Nyquist light-cache scheduler ------------------------------------
+    // Decides whether this frame needs a visible cache handoff/rebuild and, when
+    // enabled, schedules one hidden partial build into the third physical cache.
+    {
+        using namespace DirectX;
+        const bool subN = settings.useLightCacheSubNyquist;
+        const bool subNJustToggled = (subN != m_subNyquistWasEnabled);
+        m_subNyquistWasEnabled = subN;
+        if (m_amortizedCacheEnabled != settings.useAmortizedCache)
+        {
+            m_amortizedCacheEnabled = settings.useAmortizedCache;
+            ResetAmortizedCacheState();
+        }
+        const bool amortized = subN && m_amortizedCacheEnabled;
+
+        const bool lutJustToggledOn = settings.useNormalLUT && !m_prevUseNormalLUT;
+        m_prevUseNormalLUT = settings.useNormalLUT;
+        if (lutJustToggledOn)
+        {
+            m_normalLUTBaked = false;
+            m_normalLUTBakedSlots = {};
+            if (m_cacheHasValidB)
+                m_forceBakeLUTABBoth = true;
+        }
+
+        const XMVECTOR curL = XMLoadFloat3(&m_effectiveLightDirection);
+        const uint32_t totalColumns = m_gridResolution * m_gridResolution;
+        const uint32_t fullRangeEnd = std::max(totalColumns, 1u);
+
+        m_pendingCacheRebuild = false;
+        m_pendingCacheWriteSlot = 0;
+        m_pendingFirstBWrite = false;
+        m_pendingPredictiveBuild = false;
+        m_pendingProgressiveBuild = false;
+        m_pendingCacheSwap = false;
+        m_pendingCacheBuildRangeStart = 0;
+        m_pendingCacheBuildRangeEnd = fullRangeEnd;
+        m_cachePredictedLightDir = m_effectiveLightDirection;
+
+        if (!subN)
+        {
+            ResetAmortizedCacheState();
+            m_cacheBlend = 0.0f;
+            if (subNJustToggled)
+            {
+                m_cacheValid = false;
+                m_cacheOldPhysical = 0;
+                m_cacheBothPopulated = false;
+                m_cacheHasValidB = false;
+            }
+            if (!m_cacheValid || settings.rebuildCache || settings.rotateLight)
+            {
+                m_pendingCacheRebuild = true;
+                m_pendingCacheWriteSlot = 0;
+                m_cacheLightOld = m_effectiveLightDirection;
+                m_cacheLightNew = m_effectiveLightDirection;
+                m_lastCacheRebuildPhysicalSlot = 0;
+                m_normalLUTBakedSlots[0] = false;
+            }
+        }
+        else
+        {
+            const float thresholdRad =
+                std::max(settings.lightCacheAngleThresholdDeg, 0.1f) *
+                3.14159265358979323846f / 180.0f;
+            const XMVECTOR newL = XMLoadFloat3(&m_cacheLightNew);
+            const XMVECTOR oldL = XMLoadFloat3(&m_cacheLightOld);
+            const float dotOld = std::clamp(XMVectorGetX(XMVector3Dot(curL, oldL)), -1.0f, 1.0f);
+            const float dotOldNew = std::clamp(XMVectorGetX(XMVector3Dot(oldL, newL)), -1.0f, 1.0f);
+            const float angleFromOld = std::acos(dotOld);
+            const float angleOldNew  = std::acos(dotOldNew);
+            const bool crossedWindow = angleOldNew > 1e-4f
+                ? (angleFromOld > angleOldNew)
+                : (angleFromOld > thresholdRad);
+
+            if (!amortized)
+                ResetAmortizedCacheState();
+
+            if (subNJustToggled || !m_cacheValid || settings.rebuildCache)
+            {
+                m_slotDisplayA = 0;
+                m_slotDisplayB = 1;
+                m_slotBuild = 2;
+                m_pendingCacheRebuild = true;
+                m_pendingCacheWriteSlot = 0;
+                m_cacheLightOld = m_effectiveLightDirection;
+                m_cacheLightNew = RotateLightByThreshold(m_effectiveLightDirection,
+                    thresholdRad, settings);
+                m_cachePredictedLightDir = m_effectiveLightDirection;
+                m_pendingPredictiveBuild = false;
+                m_pendingSubNSeedDualBuild = true;
+                m_pendingFirstBWrite = true;
+                m_cacheOldPhysical = 0;
+                m_cacheBothPopulated = true;
+                m_cacheHasValidB = true;
+                m_lastCacheRebuildPhysicalSlot = 0;
+                m_normalLUTBakedSlots[0] = false;
+                m_normalLUTBakedSlots[1] = false;
+                m_forceBakeLUTABBoth = true;
+                m_buildActive = false;
+                m_buildComplete = false;
+                m_buildColumnCursor = 0;
+            }
+            else if (crossedWindow)
+            {
+                const uint32_t outgoingPhysical = m_cacheOldPhysical;
+                const uint32_t previousNewPhysical =
+                    (static_cast<uint32_t>(m_slotDisplayA) == outgoingPhysical)
+                        ? static_cast<uint32_t>(m_slotDisplayB)
+                        : static_cast<uint32_t>(m_slotDisplayA);
+
+                if (amortized && m_buildActive && m_buildComplete)
+                {
+                    const uint32_t newPhysical = static_cast<uint32_t>(m_slotBuild);
+                    if (static_cast<uint32_t>(m_slotDisplayA) == outgoingPhysical)
+                        m_slotDisplayA = static_cast<int>(newPhysical);
+                    else
+                        m_slotDisplayB = static_cast<int>(newPhysical);
+                    m_slotBuild = static_cast<int>(outgoingPhysical);
+
+                    m_cacheLightOld = m_cacheLightNew;
+                    m_cacheLightNew = m_buildTargetDir;
+                    m_cacheOldPhysical = previousNewPhysical;
+                    m_cacheBothPopulated = true;
+                    m_cacheHasValidB = true;
+                    m_pendingCacheSwap = true;
+                    m_lastCacheRebuildPhysicalSlot = newPhysical;
+                    m_normalLUTBakedSlots[newPhysical] = false;
+                    m_buildActive = false;
+                    m_buildComplete = false;
+                    m_buildColumnCursor = 0;
+                }
+                else
+                {
+                    const XMFLOAT3 buildTarget = RotateLightByThreshold(
+                        m_effectiveLightDirection, thresholdRad, settings);
+                    m_pendingCacheRebuild = true;
+                    m_pendingCacheWriteSlot = outgoingPhysical;
+                    m_pendingPredictiveBuild = settings.rotateLight;
+                    m_cachePredictedLightDir = buildTarget;
+                    m_cacheLightOld = m_cacheLightNew;
+                    m_cacheLightNew = buildTarget;
+                    m_cacheOldPhysical = previousNewPhysical;
+                    m_cacheBothPopulated = true;
+                    m_cacheHasValidB = true;
+                    m_lastCacheRebuildPhysicalSlot = outgoingPhysical;
+                    m_normalLUTBakedSlots[outgoingPhysical] = false;
+                    m_buildActive = false;
+                    m_buildComplete = false;
+                    m_buildColumnCursor = 0;
+                }
+            }
+
+            if (amortized && !m_pendingCacheRebuild && !m_pendingSubNSeedDualBuild)
+            {
+                const XMFLOAT3 progressiveTarget = RotateLightByThreshold(
+                    m_cacheLightNew, thresholdRad, settings);
+                bool resetBuild = !m_buildActive;
+                if (m_buildActive)
+                {
+                    const XMVECTOR oldTarget = XMLoadFloat3(&m_buildTargetDir);
+                    const XMVECTOR newTarget = XMLoadFloat3(&progressiveTarget);
+                    const float targetDot = std::clamp(
+                        XMVectorGetX(XMVector3Dot(oldTarget, newTarget)), -1.0f, 1.0f);
+                    resetBuild = std::acos(targetDot) > (2.0f * 3.14159265358979323846f / 180.0f);
+                }
+                if (resetBuild)
+                {
+                    m_buildTargetDir = progressiveTarget;
+                    m_buildColumnCursor = 0;
+                    m_buildActive = true;
+                    m_buildComplete = false;
+                }
+
+                if (!m_buildComplete)
+                {
+                    const float radiansPerFrame = (settings.rotateLight && dt > 0.0f)
+                        ? std::fabs(settings.lightRotationSpeed) * dt
+                        : 0.0f;
+                    const float framesBetween = radiansPerFrame > 1e-6f
+                        ? std::max(thresholdRad / radiansPerFrame, 1.0f)
+                        : 1.0f;
+                    // C must be complete BEFORE the crossedWindow frame arrives.
+                    // We only advance on non-rebuild frames, so given `framesBetween`
+                    // between rebuilds, we get at most (framesBetween - 1) build
+                    // opportunities. Subtract a small headroom (1 frame) so C is
+                    // fully baked with margin, otherwise crossedWindow falls back to
+                    // the sync path and the spike we're trying to hide reappears.
+                    const float availableFrames =
+                        std::max(std::floor(framesBetween) - 1.0f, 1.0f);
+                    m_buildColumnsPerFrame = std::max(1u,
+                        static_cast<uint32_t>(std::ceil(
+                            static_cast<float>(totalColumns) / availableFrames)));
+                    m_buildColumnsPerFrame = std::min(m_buildColumnsPerFrame, fullRangeEnd);
+
+                    const uint32_t startColumn = std::min(
+                        static_cast<uint32_t>(std::max(m_buildColumnCursor, 0)), fullRangeEnd);
+                    const uint32_t endColumn = std::min(startColumn + m_buildColumnsPerFrame, fullRangeEnd);
+                    if (endColumn > startColumn)
+                    {
+                        m_pendingProgressiveBuild = true;
+                        m_pendingCacheWriteSlot = static_cast<uint32_t>(m_slotBuild);
+                        m_cachePredictedLightDir = m_buildTargetDir;
+                        m_pendingPredictiveBuild = true;
+                        m_pendingCacheBuildRangeStart = startColumn;
+                        m_pendingCacheBuildRangeEnd = endColumn;
+                    }
+                    else
+                    {
+                        m_buildComplete = true;
+                    }
+                }
+            }
+
+            if (m_cacheBothPopulated)
+            {
+                const XMVECTOR oldL2 = XMLoadFloat3(&m_cacheLightOld);
+                const XMVECTOR newL2 = XMLoadFloat3(&m_cacheLightNew);
+                const float dotOldCur =
+                    std::clamp(XMVectorGetX(XMVector3Dot(oldL2, curL)), -1.0f, 1.0f);
+                const float dotOldNew2 =
+                    std::clamp(XMVectorGetX(XMVector3Dot(oldL2, newL2)), -1.0f, 1.0f);
+                const float angFromOld = std::acos(dotOldCur);
+                const float angOldNew2 = std::acos(dotOldNew2);
+                const float t = angOldNew2 > 1e-4f
+                    ? std::clamp(angFromOld / angOldNew2, 0.0f, 1.0f)
+                    : 0.0f;
+                m_cacheBlend = (static_cast<uint32_t>(m_slotDisplayA) == m_cacheOldPhysical)
+                    ? t : (1.0f - t);
+                m_cacheLogicalT = t;
+            }
+            else
+            {
+                m_cacheBlend = 0.0f;
+                m_cacheLogicalT = 0.0f;
+            }
+        }
+        constants.cacheParameters.w = m_cacheBlend;
+        constants.cacheBuildRange = { 0.0f, static_cast<float>(fullRangeEnd), 0.0f, 0.0f };
+
+        if (subN && m_cacheBothPopulated)
+        {
+            const DirectX::XMFLOAT3& dirBakedInA =
+                (static_cast<uint32_t>(m_slotDisplayA) == m_cacheOldPhysical)
+                    ? m_cacheLightOld : m_cacheLightNew;
+            const DirectX::XMFLOAT3& dirBakedInB =
+                (static_cast<uint32_t>(m_slotDisplayB) == m_cacheOldPhysical)
+                    ? m_cacheLightOld : m_cacheLightNew;
+            FillLightConstants(constants, dirBakedInA);
+            FillLightCacheAxesB(constants, dirBakedInB);
+
+            const XMVECTOR oldV = XMLoadFloat3(&m_cacheLightOld);
+            const XMVECTOR newV = XMLoadFloat3(&m_cacheLightNew);
+            const XMVECTOR interp = XMVector3Normalize(XMVectorLerp(oldV, newV, m_cacheLogicalT));
+            DirectX::XMFLOAT3 interpDir;
+            XMStoreFloat3(&interpDir, interp);
+            constants.lightDirectionGrid = { interpDir.x, interpDir.y, interpDir.z,
+                static_cast<float>(m_gridResolution) };
+        }
+    }
+    // Scene constants → scene CBV slot (offset 0 within this frame's 3-slot triplet).
+    const uint32_t sceneOffset = m_frameIndex * ConstantStride * 3;
+    const uint32_t buildOffset = sceneOffset + ConstantStride;
+    const uint32_t seedBBuildOffset = sceneOffset + 2u * ConstantStride;
+    std::memcpy(m_constantData + sceneOffset, &constants, sizeof(constants));
+
+    // Build constants: identical to scene EXCEPT the light frame is set to the
+    // predictive target dir. When we're not rebuilding, we still write valid
+    // constants at the build slot so any bound CBV is defined; when we're
+    // rebuilding but not predictive (manual light change), buildTarget == current
+    // → constants are effectively identical to scene. Predictive rotating light
+    // is where this actually diverges from scene constants.
+    ShaderConstants buildConstants = constants;
+    FillLightConstants(buildConstants, m_cachePredictedLightDir);
+    buildConstants.cacheBuildRange = {
+        static_cast<float>(m_pendingCacheBuildRangeStart),
+        static_cast<float>(m_pendingCacheBuildRangeEnd),
+        0.0f, 0.0f
+    };
+    std::memcpy(m_constantData + buildOffset, &buildConstants, sizeof(buildConstants));
+
+    // Seed-B build constants: used only on the sub-Nyquist toggle-on frame to
+    // populate physical B in a second RecordCacheBuild pass with a look-ahead
+    // direction (m_cacheLightNew). Always write valid data at this slot so any
+    // bound CBV is defined even on non-seed frames.
+    ShaderConstants seedBBuildConstants = constants;
+    FillLightConstants(seedBBuildConstants, m_cacheLightNew);
+    seedBBuildConstants.cacheBuildRange = { 0.0f,
+        static_cast<float>(std::max(m_gridResolution * m_gridResolution, 1u)), 0.0f, 0.0f };
+    std::memcpy(m_constantData + seedBBuildOffset, &seedBBuildConstants,
+        sizeof(seedBBuildConstants));
 }
 
 void Renderer::BeginFrame()
@@ -1149,7 +1795,7 @@ void Renderer::BeginFrame()
     m_commandList->SetComputeRootDescriptorTable(0, GpuHandle(OutputUav));
     m_commandList->SetComputeRootDescriptorTable(1, GpuHandle(DensitySrv));
     m_commandList->SetComputeRootConstantBufferView(2,
-        m_constantBuffer->GetGPUVirtualAddress() + m_frameIndex * ConstantStride);
+        m_constantBuffer->GetGPUVirtualAddress() + m_frameIndex * ConstantStride * 3);
     const uint32_t zeroConstants[4]{};
     m_commandList->SetComputeRoot32BitConstants(3, 4, zeroConstants, 0);
 }
@@ -1211,15 +1857,31 @@ void Renderer::RecordBakeVolumes(const RenderSettings& settings)
     m_bakedDensityGamma = settings.densityGamma;
     m_bakedDensityScale = settings.densityScale;
     m_bakeVolumesPending = false;
+    m_normalLUTBakedSlots = {};
+    m_normalLUTBaked = false;
+    m_normalLUTBBaked = false;
 }
 
-void Renderer::RecordCacheBuild(const RenderSettings& settings)
+void Renderer::RecordCacheBuild(const RenderSettings& settings, uint32_t writeSlot)
 {
     PIXScopedEvent(m_commandList.Get(), PIX_COLOR(80, 180, 220), "CacheBuild");
     const uint32_t queryBase = m_frameIndex * TimestampCount;
+    // Point the u3 (CachedDepthWrite) descriptor at the physical buffer we want to
+    // populate this rebuild. Rewrite is CPU-side; safe because BeginFrame WaitForGpu
+    // guarantees no in-flight dispatch is reading this heap slot.
+    ID3D12Resource* writeTarget = PhysicalCache(writeSlot);
+    D3D12_RESOURCE_STATES& writeTargetState = PhysicalCacheState(writeSlot);
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC coarseUav{};
+        coarseUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        coarseUav.Format = DXGI_FORMAT_R16_FLOAT;
+        coarseUav.Texture3D.WSize = static_cast<UINT>(m_gridResolution);
+        m_device->CreateUnorderedAccessView(writeTarget, nullptr, &coarseUav,
+            CpuHandle(TransmittanceUav));
+    }
     Transition(m_densityBuffer.Get(), m_densityState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Transition(m_linksBuffer.Get(), m_linksState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    Transition(m_transmittanceBuffer.Get(), m_transmittanceState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Transition(writeTarget, writeTargetState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Transition(m_statsBuffer.Get(), m_statsState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     {
@@ -1238,8 +1900,15 @@ void Renderer::RecordCacheBuild(const RenderSettings& settings)
         PIXScopedEvent(m_commandList.Get(), PIX_COLOR(60, 200, 120), "ResolveColumns");
         m_commandList->SetPipelineState(m_resolvePso.Get());
         const uint32_t columnCount = m_gridResolution * m_gridResolution;
+        const uint32_t startColumn = std::min(m_pendingCacheBuildRangeStart, columnCount);
+        const uint32_t endColumn = std::min(
+            m_pendingCacheBuildRangeEnd == 0 ? columnCount : m_pendingCacheBuildRangeEnd,
+            columnCount);
+        const uint32_t dispatchColumns = endColumn > startColumn
+            ? endColumn - startColumn
+            : columnCount;
         const uint32_t wavesPerGroup = 256u / m_waveLaneCount;
-        m_commandList->Dispatch((columnCount + wavesPerGroup - 1) / wavesPerGroup, 1, 1);
+        m_commandList->Dispatch((dispatchColumns + wavesPerGroup - 1) / wavesPerGroup, 1, 1);
     }
     m_commandList->EndQuery(m_queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 3);
     UavBarrier(m_densityBuffer.Get());
@@ -1250,7 +1919,7 @@ void Renderer::RecordCacheBuild(const RenderSettings& settings)
     m_commandList->EndQuery(m_queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 7);
     Transition(m_densityBuffer.Get(), m_densityState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Transition(m_linksBuffer.Get(), m_linksState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Transition(m_transmittanceBuffer.Get(), m_transmittanceState,
+    Transition(writeTarget, writeTargetState,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     Transition(m_statsBuffer.Get(), m_statsState, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1270,6 +1939,81 @@ void Renderer::RecordScene(const RenderSettings& settings, bool cacheRebuiltThis
     const uint32_t queryBase = m_frameIndex * TimestampCount;
     const uint32_t tileCountX = (m_width + 7) / 8;
     const uint32_t tileCountY = (m_height + 7) / 8;
+
+    // ---- Temporal reuse -------------------------------------------------------
+    // Compute a hash of every setting that affects the rendered image, INCLUDING
+    // camera pose. For volumetric rendering there is no safe per-pixel reprojection:
+    // any camera translation or rotation changes every ray's origin/direction and
+    // therefore the slice of the volume every pixel integrates. Only frames where
+    // the camera is bit-exactly static can be reused without ghosting/smearing.
+    // Under this policy the reprojection pass is effectively "copy the whole image
+    // when the camera is idle" — still a big win for idle-camera iteration but
+    // never produces incorrect content.
+    uint64_t settingsHash = 0;
+    {
+        auto mix = [&](const void* p, size_t n)
+        {
+            const uint8_t* b = static_cast<const uint8_t*>(p);
+            for (size_t i = 0; i < n; ++i)
+                settingsHash = (settingsHash ^ b[i]) * 1099511628211ull;
+        };
+        settingsHash = 14695981039346656037ull;
+        RenderSettings hashCopy = settings;
+        hashCopy.rebuildCache = false;      // transient
+        hashCopy.debugTemporalReuse = false; // pure overlay; doesn't affect main image
+        mix(&hashCopy, sizeof(hashCopy));
+        uint32_t dims[3] = { m_width, m_height, m_gridResolution };
+        mix(dims, sizeof(dims));
+    }
+    const bool globalInvalidate = !m_temporalHistoryValid
+        || cacheRebuiltThisFrame
+        || settingsHash != m_lastSettingsHash
+        || !settings.useTemporalReuse
+        || settings.debugVoxels
+        || settings.debugTiles
+        || settings.debugDistanceField
+        || settings.showDensityHeatmap // heatmap must recount every frame
+        // Time-driven motions change the effective camera / light every frame even
+        // when the hashed settings don't move, so reuse would silently stall them.
+        || settings.autoOrbit
+        || settings.rotateLight;
+
+    // Always clear the reuse-valid mask; TemporalReprojectCS only writes 1's where it
+    // successfully sampled history. Cleared unconditionally so the main render's
+    // early-out works even when reprojection is skipped.
+    Transition(m_reuseValidTexture.Get(), m_reuseValidState,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    {
+        const UINT clearVals[4] = { 0, 0, 0, 0 };
+        m_commandList->ClearUnorderedAccessViewUint(
+            GpuHandle(ReuseValidUav), CpuHandle(ReuseValidUav),
+            m_reuseValidTexture.Get(), clearVals, 0, nullptr);
+        UavBarrier(m_reuseValidTexture.Get());
+    }
+
+    if (settings.useTemporalReuse && !globalInvalidate)
+    {
+        // Camera and every setting matched last frame → the correct image is exactly
+        // last frame's Output. Blit history back into Output and mark every pixel as
+        // reused so the main render's early-out skips every trace. This is the only
+        // safe reuse policy for a volumetric render: no per-pixel reprojection can
+        // approximate integrated-along-ray content without ghosting.
+        PIXScopedEvent(m_commandList.Get(), PIX_COLOR(120, 200, 220), "TemporalReuseCopy");
+        Transition(m_historyColorTexture.Get(), m_historyColorState,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(m_outputTexture.Get(), m_outputState,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        m_commandList->CopyResource(m_outputTexture.Get(), m_historyColorTexture.Get());
+        Transition(m_outputTexture.Get(), m_outputState,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // Fill the reuse mask with 1 so every pixel of the main render early-outs.
+        const UINT ones[4] = { 1, 1, 1, 1 };
+        m_commandList->ClearUnorderedAccessViewUint(
+            GpuHandle(ReuseValidUav), CpuHandle(ReuseValidUav),
+            m_reuseValidTexture.Get(), ones, 0, nullptr);
+        UavBarrier(m_reuseValidTexture.Get());
+    }
+
     if (settings.enableTileClassify)
     {
         Transition(m_tileClassificationBuffer.Get(), m_tileClassificationState,
@@ -1288,34 +2032,62 @@ void Renderer::RecordScene(const RenderSettings& settings, bool cacheRebuiltThis
         Transition(m_tileClassificationBuffer.Get(), m_tileClassificationState,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
+    // Two-LUT sub-Nyquist scheme: descriptor slots A/B now point at the two
+    // displayed physical caches, which may be any two of A/B/C after an amortized
+    // handoff. Bake only the displayed LUT(s) whose physical cache was just replaced.
     const bool useNormalLUT = !naive && settings.useNormalLUT;
-    // The normal LUT is derived from the transmittance cache — only rebake it when the
-    // cache itself was rebuilt this frame. Previously this dispatched every frame and
-    // dominated the profile (~21% of self samples in look-up-from-below shots).
-    const bool bakeNormalLUT = useNormalLUT && (cacheRebuiltThisFrame || !m_normalLUTBaked);
-    if (bakeNormalLUT)
+    const uint32_t displayASlot = static_cast<uint32_t>(m_slotDisplayA);
+    const uint32_t displayBSlot = m_cacheBothPopulated
+        ? static_cast<uint32_t>(m_slotDisplayB)
+        : displayASlot;
+    const bool wroteDisplayedA = cacheRebuiltThisFrame &&
+        (m_lastCacheRebuildPhysicalSlot == displayASlot);
+    const bool wroteDisplayedB = cacheRebuiltThisFrame && m_cacheHasValidB &&
+        (m_lastCacheRebuildPhysicalSlot == displayBSlot);
+    const bool bakeNormalLUTA = useNormalLUT &&
+        (wroteDisplayedA || !m_normalLUTBakedSlots[displayASlot] || m_forceBakeLUTABBoth);
+    const bool bakeNormalLUTB = useNormalLUT && m_cacheHasValidB &&
+        (wroteDisplayedB || !m_normalLUTBakedSlots[displayBSlot] || m_forceBakeLUTABBoth);
+
+    ID3D12Resource* lutA = PhysicalNormalLUT(displayASlot);
+    ID3D12Resource* lutB = PhysicalNormalLUT(displayBSlot);
+    D3D12_RESOURCE_STATES& lutAState = PhysicalNormalLUTState(displayASlot);
+    D3D12_RESOURCE_STATES& lutBState = PhysicalNormalLUTState(displayBSlot);
+    if (bakeNormalLUTA)
     {
         PIXScopedEvent(m_commandList.Get(), PIX_COLOR(180, 140, 220), "BakeNormalLUT");
-        Transition(m_normalLUTTexture.Get(), m_normalLUTState,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Transition(lutA, lutAState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         m_commandList->SetPipelineState(m_bakeNormalLUTPso.Get());
-            const uint32_t nlutGroups = (m_normalLUTResolution + 3) / 4;
-            m_commandList->Dispatch(nlutGroups, nlutGroups, nlutGroups);
-        UavBarrier(m_normalLUTTexture.Get());
-        Transition(m_normalLUTTexture.Get(), m_normalLUTState,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        m_normalLUTBaked = true;
+        const uint32_t nlutGroups = (m_normalLUTResolution + 3) / 4;
+        m_commandList->Dispatch(nlutGroups, nlutGroups, nlutGroups);
+        UavBarrier(lutA);
+        Transition(lutA, lutAState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        m_normalLUTBakedSlots[displayASlot] = true;
+        m_normalLUTBaked = (displayASlot == 0) ? true : m_normalLUTBaked;
     }
-    else if (useNormalLUT && m_normalLUTState != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+    else if (lutAState != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
     {
-        Transition(m_normalLUTTexture.Get(), m_normalLUTState,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Transition(lutA, lutAState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
-    else if (!useNormalLUT && m_normalLUTState != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+    if (bakeNormalLUTB)
     {
-        Transition(m_normalLUTTexture.Get(), m_normalLUTState,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        PIXScopedEvent(m_commandList.Get(), PIX_COLOR(180, 140, 220), "BakeNormalLUTB");
+        Transition(lutB, lutBState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_commandList->SetPipelineState(m_bakeNormalLUTBPso.Get());
+        const uint32_t nlutGroups = (m_normalLUTResolution + 3) / 4;
+        m_commandList->Dispatch(nlutGroups, nlutGroups, nlutGroups);
+        UavBarrier(lutB);
+        Transition(lutB, lutBState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        m_normalLUTBakedSlots[displayBSlot] = true;
+        m_normalLUTBBaked = (displayBSlot == 1) ? true : m_normalLUTBBaked;
+        m_normalLUTBValid = true;
     }
+    else if (lutBState != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+    {
+        Transition(lutB, lutBState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    // One-shot flag consumed by this frame's bake decisions.
+    m_forceBakeLUTABBoth = false;
     const bool useVariant = settings.useSplitTrace && settings.useTileVariantDispatch
         && settings.enableTileClassify;
     const uint32_t dispatchParams[4] = {
@@ -1421,17 +2193,28 @@ void Renderer::RecordScene(const RenderSettings& settings, bool cacheRebuiltThis
             // Reduced-tap normals only meaningful when the LUT is off (LUT path is
             // already 1 tap, unaffected by USE_REDUCED_TAP_NORMAL).
             const bool useReduced = settings.useReducedTapNormals && !useNormalLUT;
+            // Sub-Nyquist-off specialisation: when the tickbox is off, dispatch a
+            // PSO compiled without USE_SUB_NYQUIST so DXC has already dead-stripped
+            // the B-cache taps / LUT_B sample / gradB blend from the shader.
+            // Density-heatmap Count PSOs and Reduced-tap PSOs still use the SubN
+            // variant (only 4 primary combos have a NoSubN specialisation today).
+            const bool noSubN = !settings.useLightCacheSubNyquist
+                && !settings.showDensityHeatmap && !useReduced;
             if (settings.useDistanceField)
             {
-                if (useNormalLUT)          cached = m_cachedDfLutPso.Get();
-                else if (useReduced)       cached = m_cachedDfReducedTapPso.Get();
-                else                       cached = m_cachedDfPso.Get();
+                if (noSubN && useNormalLUT)     cached = m_cachedDfLutNoSubNPso.Get();
+                else if (noSubN)                cached = m_cachedDfNoSubNPso.Get();
+                else if (useNormalLUT)          cached = m_cachedDfLutPso.Get();
+                else if (useReduced)            cached = m_cachedDfReducedTapPso.Get();
+                else                            cached = m_cachedDfPso.Get();
             }
             else
             {
-                if (useNormalLUT)          cached = m_cachedLutPso.Get();
-                else if (useReduced)       cached = m_cachedReducedTapPso.Get();
-                else                       cached = m_cachedPso.Get();
+                if (noSubN && useNormalLUT)     cached = m_cachedLutNoSubNPso.Get();
+                else if (noSubN)                cached = m_cachedNoSubNPso.Get();
+                else if (useNormalLUT)          cached = m_cachedLutPso.Get();
+                else if (useReduced)            cached = m_cachedReducedTapPso.Get();
+                else                            cached = m_cachedPso.Get();
             }
         }
         else
@@ -1448,6 +2231,17 @@ void Renderer::RecordScene(const RenderSettings& settings, bool cacheRebuiltThis
     }
     m_commandList->EndQuery(m_queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 9);
     UavBarrier(m_outputTexture.Get());
+
+    // Snapshot the CLEAN raymarched Output into HistoryColor before any debug
+    // overlay writes to it. If we snapshotted at end-of-frame, debug tints
+    // (reuse heatmap, tile overlay, DDA overlay, density heatmap) would leak into
+    // history and next-frame reprojection would sample those tints — turning the
+    // screen the debug colour forever until a global invalidate.
+    Transition(m_outputTexture.Get(), m_outputState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(m_historyColorTexture.Get(), m_historyColorState, D3D12_RESOURCE_STATE_COPY_DEST);
+    m_commandList->CopyResource(m_historyColorTexture.Get(), m_outputTexture.Get());
+    Transition(m_outputTexture.Get(), m_outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
     // Heatmap display pass: takes SampleCountWrite (u14) populated by the *_CountCS
     // dispatch and blends a false-colour count overlay over Output. Uses
     // DispatchParameters.z to carry heatmapMaxSamples (temporarily overrides the
@@ -1479,7 +2273,23 @@ void Renderer::RecordScene(const RenderSettings& settings, bool cacheRebuiltThis
         m_commandList->Dispatch(tileCountX, tileCountY, 1);
         UavBarrier(m_outputTexture.Get());
     }
+
+    // Temporal-reuse debug overlay: green = pixel filled from history, red = pixel
+    // marched this frame. Runs whenever the toggle is on (even on globally-invalidated
+    // frames) so the user can see the moments where reuse fell through — the mask is
+    // all-zero on invalidated frames so those show up entirely red.
+    if (settings.useTemporalReuse && settings.debugTemporalReuse)
+    {
+        PIXScopedEvent(m_commandList.Get(), PIX_COLOR(120, 220, 120), "TemporalReuseDebug");
+        m_commandList->SetPipelineState(m_temporalReuseDebugPso.Get());
+        m_commandList->Dispatch(tileCountX, tileCountY, 1);
+        UavBarrier(m_outputTexture.Get());
+    }
+
     Transition(m_outputTexture.Get(), m_outputState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    // History was already snapshotted before the overlays. Update tracking state.
+    m_lastSettingsHash = settingsHash;
+    m_temporalHistoryValid = true;
 }
 
 void Renderer::Render(RenderSettings& settings, ImDrawData* drawData, float timeSeconds)
@@ -1498,13 +2308,14 @@ void Renderer::Render(RenderSettings& settings, ImDrawData* drawData, float time
         CreateNormalLUT(static_cast<uint32_t>(settings.normalLUTResolution));
     }
     m_cacheBuiltFrames[m_frameIndex] = false;
-    if (settings.rotateLight)
+    if (settings.rotateLight && !settings.useLightCacheSubNyquist)
         settings.rebuildCache = true;
     if (settings.densityThreshold != m_bakedDensityThreshold ||
         settings.densityGamma != m_bakedDensityGamma ||
         settings.densityScale != m_bakedDensityScale)
         m_bakeVolumesPending = true;
     PopulateConstants(settings, timeSeconds);
+    RebindCacheDescriptors();
 
     m_commandList->EndQuery(m_queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
     if (m_bakeVolumesPending)
@@ -1512,12 +2323,71 @@ void Renderer::Render(RenderSettings& settings, ImDrawData* drawData, float time
         RecordBakeVolumes(settings);
         settings.rebuildCache = true;
     }
-    bool cacheRebuiltThisFrame = false;
-    if (settings.rebuildCache || !m_cacheValid)
+    bool cacheRebuiltThisFrame = m_pendingCacheSwap;
+    if (m_pendingCacheRebuild || settings.rebuildCache)
     {
-        RecordCacheBuild(settings);
+        const uint32_t writeSlot = m_pendingCacheWriteSlot;
+        const bool predictive = m_pendingPredictiveBuild;
+        const uint64_t sceneCbv =
+            m_constantBuffer->GetGPUVirtualAddress() + m_frameIndex * ConstantStride * 3;
+        const uint64_t buildCbv = sceneCbv + ConstantStride;
+        const uint64_t seedBBuildCbv = sceneCbv + 2u * ConstantStride;
+        bool boundNonSceneCbv = false;
+        if (predictive)
+        {
+            // Point b0 at the build-constants slot so ResolveColumnsCS reads the
+            // predictive-target light frame instead of the current-frame one.
+            m_commandList->SetComputeRootConstantBufferView(2, buildCbv);
+            boundNonSceneCbv = true;
+        }
+        RecordCacheBuild(settings, writeSlot);
+        m_lastCacheRebuildWroteToB = (writeSlot == 1);
+        m_lastCacheRebuildPhysicalSlot = writeSlot;
+        if (m_pendingSubNSeedDualBuild)
+        {
+            // Sub-Nyquist seed-dual: after the primary writeToA build (current
+            // light dir), immediately fire a SECOND build into physical B using
+            // the look-ahead direction stored in m_cacheLightNew. Switch b0 to
+            // the seed-B build CBV so ResolveColumnsCS uses that direction's
+            // frame axes. This populates both physicals in one frame so the
+            // first rendered frame after the toggle already has valid two-LUT
+            // interpolation data — no stale/empty B, no visible seam.
+            m_commandList->SetComputeRootConstantBufferView(2, seedBBuildCbv);
+            m_pendingCacheBuildRangeStart = 0;
+            m_pendingCacheBuildRangeEnd = std::max(m_gridResolution * m_gridResolution, 1u);
+            RecordCacheBuild(settings, 1);
+            m_lastCacheRebuildWroteToB = true;
+            m_lastCacheRebuildPhysicalSlot = 1;
+            m_pendingSubNSeedDualBuild = false;
+            boundNonSceneCbv = true;
+        }
+        if (boundNonSceneCbv)
+        {
+            // Restore scene CBV for the rest of the frame's dispatches (bake,
+            // RecordScene, temporal, etc.).
+            m_commandList->SetComputeRootConstantBufferView(2, sceneCbv);
+        }
         settings.rebuildCache = false;
         cacheRebuiltThisFrame = true;
+        m_cacheValid = true;
+        m_pendingCacheRebuild = false;
+        m_pendingFirstBWrite = false;
+    }
+    if (m_pendingProgressiveBuild)
+    {
+        const uint64_t sceneCbv =
+            m_constantBuffer->GetGPUVirtualAddress() + m_frameIndex * ConstantStride * 3;
+        const uint64_t buildCbv = sceneCbv + ConstantStride;
+        m_commandList->SetComputeRootConstantBufferView(2, buildCbv);
+        RecordCacheBuild(settings, static_cast<uint32_t>(m_slotBuild));
+        m_commandList->SetComputeRootConstantBufferView(2, sceneCbv);
+        m_buildColumnCursor = static_cast<int>(m_pendingCacheBuildRangeEnd);
+        if (m_buildColumnCursor >= static_cast<int>(m_gridResolution * m_gridResolution))
+        {
+            m_buildColumnCursor = static_cast<int>(m_gridResolution * m_gridResolution);
+            m_buildComplete = true;
+        }
+        m_pendingProgressiveBuild = false;
     }
     RecordScene(settings, cacheRebuiltThisFrame);
 
@@ -1585,6 +2455,7 @@ void Renderer::ReadCompletedTimings(uint32_t frameIndex)
         const float totalSample = static_cast<float>((timestamps[1] - timestamps[0]) * scale);
         const float renderSample = static_cast<float>((timestamps[9] - timestamps[8]) * scale);
         m_stats.gpuRenderSampleMs = renderSample;
+        m_stats.gpuTotalSampleMs = totalSample;
         m_stats.gpuTotalMs = smooth(m_stats.gpuTotalMs, totalSample, smoothing);
         m_stats.gpuRenderMs = smooth(m_stats.gpuRenderMs, renderSample, smoothing);
         if (m_cacheBuiltFrames[frameIndex])
@@ -1595,8 +2466,12 @@ void Renderer::ReadCompletedTimings(uint32_t frameIndex)
             m_stats.lastCacheBuildMs = m_stats.gpuVoxelizeMs + m_stats.gpuLinkMs + m_stats.gpuResolveMs;
         }
         m_timestampReadbacks[frameIndex]->Unmap(0, nullptr);
+        // Store raw per-frame samples (not smoothed) so graph min/max reflect the
+        // true extremes — including cache-rebuild spikes on the total series.
         std::move(m_stats.gpuHistory.begin() + 1, m_stats.gpuHistory.end(), m_stats.gpuHistory.begin());
-        m_stats.gpuHistory.back() = m_stats.gpuRenderMs;
+        m_stats.gpuHistory.back() = renderSample;
+        std::move(m_stats.gpuTotalHistory.begin() + 1, m_stats.gpuTotalHistory.end(), m_stats.gpuTotalHistory.begin());
+        m_stats.gpuTotalHistory.back() = totalSample;
     }
 
     if (m_cacheBuiltFrames[frameIndex])
@@ -1698,6 +2573,11 @@ void Renderer::DestroySizeDependentResources()
     m_indirectDispatchArgsState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     m_sampleCountTexture.Reset();
     m_sampleCountState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_reuseValidTexture.Reset();
+    m_reuseValidState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_historyColorTexture.Reset();
+    m_historyColorState = D3D12_RESOURCE_STATE_COPY_DEST;
+    m_temporalHistoryValid = false;
     for (auto& buffer : m_backBuffers)
         buffer.Reset();
 }
@@ -1719,6 +2599,58 @@ void Renderer::Resize(uint32_t width, uint32_t height)
     }
     else
         SetError("Swapchain resize failed.");
+}
+
+bool Renderer::LoadVolume(const std::filesystem::path& path)
+{
+    if (!m_initialized)
+    {
+        SetError("LoadVolume called before Initialize.");
+        return false;
+    }
+    // Ensure no in-flight work references the resources we're about to reset. Frame
+    // fence values are cleared so the next Signal/Wait pair in Render() starts from
+    // a clean slate rather than comparing against stale values.
+    WaitForGpu();
+    for (FrameContext& frame : m_frames)
+        frame.fenceValue = 0;
+
+    // Drop VDB-owned GPU resources. Descriptor heap slots (DenseVolumeSrv, ...) will
+    // be overwritten by CreateVdbResources — no need to null them explicitly.
+    m_denseVolumeTexture.Reset();
+    m_sparsePageTexture.Reset();
+    m_sparseBrickBuffer.Reset();
+    m_remappedVolumeTexture.Reset();
+    m_remappedVolumeState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_distanceFieldTextureA.Reset();
+    m_distanceFieldTextureB.Reset();
+    m_distanceFieldAState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_distanceFieldBState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    // Force the normal LUT to re-bake against the new density field. CreateNormalLUT
+    // early-outs when the resolution matches, so the resource itself may be reused —
+    // but the *contents* are stale until re-baked.
+    m_normalLUTBaked = false;
+    m_normalLUTBBaked = false;
+    m_normalLUTBakedSlots = {};
+
+    // LoadVdbVolume appends to brickPool/pageTable without pre-clearing; use a fresh
+    // instance so residual data from the previous volume can't leak into the upload.
+    m_volumeData = VolumeData{};
+
+    if (!LoadVdbVolume(path, m_volumeData, m_lastError))
+        return false;
+
+    if (!CreateVdbResources())
+        return false;
+
+    // Invalidate everything derived from the previous volume so the next Render()
+    // frame rebuilds the transmittance cache, coarse depth, and temporal history
+    // against the new density field.
+    m_cacheValid = false;
+    ResetAmortizedCacheState();
+    m_temporalHistoryValid = false;
+    m_bakeVolumesPending = true;
+    return true;
 }
 
 void Renderer::Shutdown()
